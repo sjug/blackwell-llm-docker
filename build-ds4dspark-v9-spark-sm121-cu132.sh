@@ -63,8 +63,9 @@ export FLASHINFER_REF="${FLASHINFER_REF:-${FLASHINFER_COMMIT}}"
 export FLASHINFER_BUILD_CUBIN="${FLASHINFER_BUILD_CUBIN:-0}"
 
 export DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}"
-export DEEPGEMM_REF="${DEEPGEMM_REF:-nv_dev}"
+# nv_dev has moved past the v9 pin; fetch the pinned commit directly.
 export DEEPGEMM_COMMIT="${DEEPGEMM_COMMIT:-2073ddb2814892014c33ef4cd1c7d4c148baf1fe}"
+export DEEPGEMM_REF="${DEEPGEMM_REF:-${DEEPGEMM_COMMIT}}"
 export DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE:-deepgemm-sm121-mqa-logits-arch-number-20260708.patch}"
 
 export B12X_REPO="${B12X_REPO:-https://github.com/lukealonso/b12x.git}"
