@@ -128,9 +128,14 @@ echo "  NCCL_REF=${NCCL_REF} ${NCCL_COMMIT}"
 echo "  HUMMING_KERNELS_SPEC=${HUMMING_KERNELS_SPEC}"
 
 # podman/buildah does not know --progress; docker BuildKit wants plain output.
+# For podman, force docker image format: the OCI format does not persist the
+# SHELL directive, so RUN steps in stages built FROM a tagged OCI base image
+# would silently fall back to /bin/sh.
 PROGRESS_ARGS=()
 if [[ "${CONTAINER_ENGINE}" == "docker" ]]; then
   PROGRESS_ARGS=(--progress=plain)
+else
+  PROGRESS_ARGS=(--format docker)
 fi
 
 if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then

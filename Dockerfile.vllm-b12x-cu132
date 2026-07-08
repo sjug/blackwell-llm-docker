@@ -363,6 +363,10 @@ RUN cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)"
 # =============================================================================
 FROM base AS flashinfer-build
 
+# Re-declare SHELL: the OCI image format does not persist it across stage
+# boundaries (podman/buildah), unlike docker-format BuildKit builds.
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
 ARG FLASHINFER_REPO
 ARG FLASHINFER_REF
 ARG FLASHINFER_COMMIT
@@ -451,6 +455,8 @@ RUN --mount=type=cache,target=/root/.ccache \
 # =============================================================================
 FROM flashinfer-build AS deepgemm-build
 
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
 ARG DEEPGEMM_REPO
 ARG DEEPGEMM_REF
 ARG DEEPGEMM_COMMIT
@@ -487,6 +493,8 @@ RUN --mount=type=cache,target=/root/.ccache \
 # =============================================================================
 FROM deepgemm-build AS b12x-build
 
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
 ARG B12X_REPO
 ARG B12X_REF
 ARG B12X_COMMIT
@@ -510,6 +518,8 @@ RUN git clone --filter=blob:none "${B12X_REPO}" /tmp/b12x-src \
 # Stage 2d: build vLLM on top of cached FlashInfer/DeepGEMM/B12X.
 # =============================================================================
 FROM b12x-build AS vllm-build
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 ARG VLLM_REPO
 ARG VLLM_REF
