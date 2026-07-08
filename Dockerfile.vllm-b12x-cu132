@@ -69,6 +69,18 @@ ARG NVCC_THREADS=1
 ARG VLLM_MAX_JOBS=128
 ARG VLLM_NVCC_THREADS=1
 
+# CUDA target architectures. Defaults match the historical SM120 (RTX PRO 6000
+# Blackwell) x86_64 build. For GB10 / DGX Spark (SM121, aarch64) pass:
+#   TORCH_CUDA_ARCH_LIST_ARG=12.1a
+#   CMAKE_CUDA_ARCHITECTURES_ARG=121a
+#   FLASHINFER_CUDA_ARCH_LIST_ARG=12.1a
+# FlashInfer builds a separate cubin per SM12x variant on purpose (it refuses
+# to run SM120 cubins on SM121), and its sm121 AOT modules are only enabled
+# when 12.1a is in the arch list — do not reuse 12.0f for a GB10 build.
+ARG TORCH_CUDA_ARCH_LIST_ARG=12.0a
+ARG CMAKE_CUDA_ARCHITECTURES_ARG=120a
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG=12.0f
+
 # =============================================================================
 # Stage 0: patched NCCL
 # =============================================================================
@@ -170,13 +182,15 @@ RUN for attempt in {1..5}; do \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cublas="$(readlink -f /usr/lib/x86_64-linux-gnu/libcublas/13/libcublas.so.13)" \
- && cublas_lt="$(readlink -f /usr/lib/x86_64-linux-gnu/libcublas/13/libcublasLt.so.13)" \
+RUN multiarch="$(uname -m)-linux-gnu" \
+ && cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && cublas="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublas.so.13)" \
+ && cublas_lt="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublasLt.so.13)" \
  && cublas_name="$(basename "${cublas}")" \
  && cublas_lt_name="$(basename "${cublas_lt}")" \
  && test -f "${cublas}" \
  && test -f "${cublas_lt}" \
- && for cuda_libdir in /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib; do \
+ && for cuda_libdir in /usr/local/cuda/targets/${cuda_target}/lib /usr/local/cuda-${CUDA_VERSION}/targets/${cuda_target}/lib; do \
       if [[ -d "${cuda_libdir}" ]]; then \
         cuda_libdir="$(readlink -f "${cuda_libdir}")"; \
         rm -f "${cuda_libdir}"/libcublas.so "${cuda_libdir}"/libcublas.so.13 "${cuda_libdir}"/libcublas.so.13.*; \
@@ -273,13 +287,17 @@ assert torch.__version__.startswith("2.12.0+cu132")
 assert torch.version.cuda == "13.2"
 PY
 
+ARG TORCH_CUDA_ARCH_LIST_ARG
+ARG CMAKE_CUDA_ARCHITECTURES_ARG
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG
+
 ENV CCACHE_DIR=/root/.ccache \
     CMAKE_C_COMPILER_LAUNCHER=ccache \
     CMAKE_CXX_COMPILER_LAUNCHER=ccache \
     CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
-    TORCH_CUDA_ARCH_LIST=12.0a \
-    CMAKE_CUDA_ARCHITECTURES=120a \
-    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST_ARG} \
+    CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES_ARG} \
+    FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST_ARG} \
     FLASHINFER_LOCAL_VERSION=cu132 \
     FLASHINFER_NVCC_THREADS=1 \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \
@@ -304,8 +322,9 @@ ENV MAX_JOBS=${MAX_JOBS} \
 
 # CUDA 13.x headers can be laid out under cccl/. Keep both old and new include
 # paths usable for third-party build scripts.
-RUN if [[ -d /usr/local/cuda/targets/x86_64-linux/include/cccl/cuda && ! -e /usr/local/cuda/include/cuda ]]; then \
-      ln -sf /usr/local/cuda/targets/x86_64-linux/include/cccl/cuda /usr/local/cuda/include/cuda; \
+RUN cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && if [[ -d /usr/local/cuda/targets/${cuda_target}/include/cccl/cuda && ! -e /usr/local/cuda/include/cuda ]]; then \
+      ln -sf /usr/local/cuda/targets/${cuda_target}/include/cccl/cuda /usr/local/cuda/include/cuda; \
     fi
 
 # =============================================================================
@@ -407,6 +426,9 @@ FROM flashinfer-build AS deepgemm-build
 ARG DEEPGEMM_REPO
 ARG DEEPGEMM_REF
 ARG DEEPGEMM_COMMIT
+ARG DEEPGEMM_PATCH_FILE
+
+COPY patches /tmp/deepgemm-build-patches
 
 RUN --mount=type=cache,target=/root/.ccache \
     git clone --recursive "${DEEPGEMM_REPO}" /tmp/deepgemm-src \
@@ -421,6 +443,10 @@ RUN --mount=type=cache,target=/root/.ccache \
       git checkout "${DEEPGEMM_REF}"; \
     fi \
  && if [[ -n "${DEEPGEMM_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${DEEPGEMM_COMMIT}" ]] || { echo "ERROR: DEEPGEMM_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${DEEPGEMM_COMMIT}" >&2; exit 1; }; fi \
+ && if [[ -n "${DEEPGEMM_PATCH_FILE}" ]]; then \
+      git apply --verbose "/tmp/deepgemm-build-patches/${DEEPGEMM_PATCH_FILE}" \
+      && git diff --check; \
+    fi \
  && git submodule update --init --recursive \
  && DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
     python -m pip install --no-build-isolation --no-deps --force-reinstall . \
@@ -796,13 +822,15 @@ print("mapped libnccl paths", unique)
 assert unique == ["/opt/libnccl.so.2.30.4"], unique
 PY
 
-RUN cublas="$(readlink -f /usr/lib/x86_64-linux-gnu/libcublas/13/libcublas.so.13)" \
- && cublas_lt="$(readlink -f /usr/lib/x86_64-linux-gnu/libcublas/13/libcublasLt.so.13)" \
+RUN multiarch="$(uname -m)-linux-gnu" \
+ && cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && cublas="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublas.so.13)" \
+ && cublas_lt="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublasLt.so.13)" \
  && cublas_name="$(basename "${cublas}")" \
  && cublas_lt_name="$(basename "${cublas_lt}")" \
  && test -f "${cublas}" \
  && test -f "${cublas_lt}" \
- && for cuda_libdir in /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda-13.2/targets/x86_64-linux/lib; do \
+ && for cuda_libdir in /usr/local/cuda/targets/${cuda_target}/lib /usr/local/cuda-13.2/targets/${cuda_target}/lib; do \
       if [[ -d "${cuda_libdir}" ]]; then \
         cuda_libdir="$(readlink -f "${cuda_libdir}")"; \
         rm -f "${cuda_libdir}"/libcublas.so "${cuda_libdir}"/libcublas.so.13 "${cuda_libdir}"/libcublas.so.13.*; \
@@ -817,11 +845,14 @@ RUN cublas="$(readlink -f /usr/lib/x86_64-linux-gnu/libcublas/13/libcublas.so.13
     done \
  && ldconfig
 
+ARG TORCH_CUDA_ARCH_LIST_ARG
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG
+
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     CUDA_DEVICE_ORDER=PCI_BUS_ID \
-    TORCH_CUDA_ARCH_LIST=12.0a \
-    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST_ARG} \
+    FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST_ARG} \
     FLASHINFER_LOCAL_VERSION=cu132 \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \
     HF_HOME=/root/.cache/huggingface \

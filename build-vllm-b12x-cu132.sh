@@ -2,6 +2,16 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-voipmonitor/vllm:vllm-b12x-cu132}"
+# Container engine: docker (default) or podman. Rootless podman works; all
+# build stages are compile-only and do not need GPU access.
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+# CUDA target archs. Defaults are the historical SM120 x86_64 values; for
+# GB10 / DGX Spark (SM121) use 12.1a / 121a / 12.1a (FlashInfer refuses to
+# run SM120 cubins on SM121 and only enables its sm121 AOT modules when
+# 12.1a is in the arch list).
+TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG:-12.0a}"
+CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG:-120a}"
+FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG:-12.0f}"
 SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE:-voipmonitor/vllm:vllm-b12x-cu132-system-base}"
 BUILD_BASE_IMAGE_TAG="${BUILD_BASE_IMAGE_TAG:-voipmonitor/vllm:vllm-b12x-cu132-build-base}"
 BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE:-1}"
@@ -19,6 +29,7 @@ FLASHINFER_REF="${FLASHINFER_REF:-refs/pull/3395/head}"
 FLASHINFER_BUILD_CUBIN="${FLASHINFER_BUILD_CUBIN:-1}"
 DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}"
 DEEPGEMM_REF="${DEEPGEMM_REF:-refs/pull/324/head}"
+DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE:-}"
 B12X_REPO="${B12X_REPO:-https://github.com/lukealonso/b12x.git}"
 B12X_REF="${B12X_REF:-refs/pull/11/head}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/local-inference-lab/vllm.git}"
@@ -103,6 +114,7 @@ echo "  VLLM_NVCC_THREADS=${VLLM_NVCC_THREADS}"
 echo "  FLASHINFER_REF=${FLASHINFER_REF} ${FLASHINFER_COMMIT}"
 echo "  FLASHINFER_BUILD_CUBIN=${FLASHINFER_BUILD_CUBIN}"
 echo "  DEEPGEMM_REF=${DEEPGEMM_REF} ${DEEPGEMM_COMMIT}"
+echo "  DEEPGEMM_PATCH_FILE=${DEEPGEMM_PATCH_FILE}"
 echo "  B12X_REF=${B12X_REF} ${B12X_COMMIT}"
 echo "  VLLM_REF=${VLLM_REF} ${VLLM_COMMIT}"
 echo "  VLLM_PATCH_URL=${VLLM_PATCH_URL}"
@@ -116,7 +128,7 @@ echo "  NCCL_REF=${NCCL_REF} ${NCCL_COMMIT}"
 echo "  HUMMING_KERNELS_SPEC=${HUMMING_KERNELS_SPEC}"
 
 if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
-  DOCKER_BUILDKIT=1 docker build \
+  DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
     --target vllm-b12x-cu132-system-base-build \
     --build-arg NCCL_REPO="${NCCL_REPO}" \
     --build-arg NCCL_REF="${NCCL_REF}" \
@@ -127,9 +139,12 @@ if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
     "$@" \
     .
 
-  DOCKER_BUILDKIT=1 docker build \
+  DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
     --target vllm-b12x-cu132-build-base-build \
     --build-arg VLLM_B12X_CU132_SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE}" \
+    --build-arg TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG}" \
+    --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
+    --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
     --progress=plain \
     -f Dockerfile.vllm-b12x-cu132 \
     -t "${BUILD_BASE_IMAGE_TAG}" \
@@ -137,14 +152,17 @@ if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
     .
 
   if [[ "${PUSH_BASE_IMAGE}" == "1" ]]; then
-    docker push "${SYSTEM_BASE_IMAGE}"
-    docker push "${BUILD_BASE_IMAGE_TAG}"
+    "${CONTAINER_ENGINE}" push "${SYSTEM_BASE_IMAGE}"
+    "${CONTAINER_ENGINE}" push "${BUILD_BASE_IMAGE_TAG}"
   fi
 fi
 
-DOCKER_BUILDKIT=1 docker build \
+DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
   --build-arg VLLM_B12X_CU132_SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE}" \
   --build-arg VLLM_B12X_CU132_BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE_TAG}" \
+  --build-arg TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG}" \
+  --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
+  --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
   --build-arg MAX_JOBS="${MAX_JOBS}" \
   --build-arg VLLM_MAX_JOBS="${VLLM_MAX_JOBS}" \
   --build-arg NVCC_THREADS="${NVCC_THREADS}" \
@@ -159,6 +177,7 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg DEEPGEMM_REPO="${DEEPGEMM_REPO}" \
   --build-arg DEEPGEMM_REF="${DEEPGEMM_REF}" \
   --build-arg DEEPGEMM_COMMIT="${DEEPGEMM_COMMIT}" \
+  --build-arg DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE}" \
   --build-arg B12X_REPO="${B12X_REPO}" \
   --build-arg B12X_REF="${B12X_REF}" \
   --build-arg B12X_COMMIT="${B12X_COMMIT}" \

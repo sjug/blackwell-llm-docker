@@ -1,0 +1,59 @@
+diff --git a/vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py b/vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py
+index f68a3f239..8c2ffe18a 100644
+--- a/vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py
++++ b/vllm/model_executor/warmup/b12x_sparse_indexer_warmup.py
+@@ -45,6 +45,30 @@ def _block_table_widths_by_layer(worker: Worker) -> dict[str, int]:
+     return widths
+ 
+ 
++def _fallback_fused_decode_warmup_rows(
++    *,
++    topk: int,
++    num_heads: int,
++    max_pages: int,
++) -> tuple[int, ...]:
++    if int(max_pages) <= 0:
++        return ()
++
++    rows = {1, 2, 4}
++    if int(topk) == 512 and int(num_heads) == 64:
++        # DeepSeek/C4 shape: b12x keeps optimized decode variants through
++        # cc64, so warm the same concurrency buckets that the benchmark uses.
++        rows.update((6, 8, 16, 32, 64))
++    elif int(topk) == 2048 and int(num_heads) == 32:
++        # GLM shape: b12x fused route is currently selected through rows 16.
++        rows.update((6, 8, 16))
++    else:
++        # Generic route retains the small-row fused policy.
++        rows.add(6)
++
++    return tuple(sorted(rows))
++
++
+ def _fused_decode_warmup_rows(
+     *,
+     topk: int,
+@@ -52,9 +76,20 @@ def _fused_decode_warmup_rows(
+     max_pages: int,
+     device: torch.device,
+ ) -> tuple[int, ...]:
+-    from b12x.attention.indexer.fused_indexer import (
+-        fused_indexer_decode_warmup_rows,
+-    )
++    try:
++        from b12x.attention.indexer.fused_indexer import (
++            fused_indexer_decode_warmup_rows,
++        )
++    except ImportError:
++        logger.warning_once(
++            "Installed b12x does not export fused_indexer_decode_warmup_rows; "
++            "using vLLM fallback B12X sparse-indexer warmup rows."
++        )
++        return _fallback_fused_decode_warmup_rows(
++            topk=topk,
++            num_heads=num_heads,
++            max_pages=max_pages,
++        )
+ 
+     return fused_indexer_decode_warmup_rows(
+         topk=topk,
