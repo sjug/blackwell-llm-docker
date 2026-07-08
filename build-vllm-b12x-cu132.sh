@@ -127,13 +127,19 @@ echo "  INSTANTTENSOR_REF=${INSTANTTENSOR_REF} ${INSTANTTENSOR_COMMIT}"
 echo "  NCCL_REF=${NCCL_REF} ${NCCL_COMMIT}"
 echo "  HUMMING_KERNELS_SPEC=${HUMMING_KERNELS_SPEC}"
 
+# podman/buildah does not know --progress; docker BuildKit wants plain output.
+PROGRESS_ARGS=()
+if [[ "${CONTAINER_ENGINE}" == "docker" ]]; then
+  PROGRESS_ARGS=(--progress=plain)
+fi
+
 if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
   DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
     --target vllm-b12x-cu132-system-base-build \
     --build-arg NCCL_REPO="${NCCL_REPO}" \
     --build-arg NCCL_REF="${NCCL_REF}" \
     --build-arg NCCL_COMMIT="${NCCL_COMMIT}" \
-    --progress=plain \
+    "${PROGRESS_ARGS[@]}" \
     -f Dockerfile.vllm-b12x-cu132 \
     -t "${SYSTEM_BASE_IMAGE}" \
     "$@" \
@@ -145,7 +151,7 @@ if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
     --build-arg TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG}" \
     --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
     --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
-    --progress=plain \
+    "${PROGRESS_ARGS[@]}" \
     -f Dockerfile.vllm-b12x-cu132 \
     -t "${BUILD_BASE_IMAGE_TAG}" \
     "$@" \
@@ -201,7 +207,7 @@ DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
   --build-arg INSTANTTENSOR_REF="${INSTANTTENSOR_REF}" \
   --build-arg INSTANTTENSOR_COMMIT="${INSTANTTENSOR_COMMIT}" \
   --build-arg HUMMING_KERNELS_SPEC="${HUMMING_KERNELS_SPEC}" \
-  --progress=plain \
+  "${PROGRESS_ARGS[@]}" \
   -f Dockerfile.vllm-b12x-cu132 \
   -t "${IMAGE}" \
   "$@" \
