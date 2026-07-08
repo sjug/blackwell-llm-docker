@@ -247,8 +247,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       nvidia-cuda-tileiras==13.2.78 \
       "nvidia-cutlass-dsl[cu13]==4.5.2" \
  && python -m pip install --force-reinstall --no-deps \
-      nvidia-cutlass-dsl-libs-cu13==4.5.2 \
- && python -m pip check
+      nvidia-cutlass-dsl-libs-cu13==4.5.2
+
+# NVIDIA aarch64 wheels (e.g. nvidia-cusparselt-cu13) record the nonstandard
+# platform tag manylinux2014_sbsa in their dist-info WHEEL metadata; pip >= 25
+# treats that as "not supported on this platform" in pip check. Normalize the
+# tag (and its RECORD hash) to the real aarch64 tag. No-op on x86_64.
+RUN python - <<'FIXSBSA'
+import base64, csv, glob, hashlib, io, pathlib
+
+for wheel in glob.glob("/opt/venv/lib/python*/site-packages/*.dist-info/WHEEL"):
+    path = pathlib.Path(wheel)
+    text = path.read_text()
+    if "manylinux2014_sbsa" not in text:
+        continue
+    path.write_text(text.replace("manylinux2014_sbsa", "manylinux2014_aarch64"))
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    record_path = path.parent / "RECORD"
+    rows = list(csv.reader(io.StringIO(record_path.read_text())))
+    for row in rows:
+        if row and row[0].endswith(".dist-info/WHEEL"):
+            row[1] = f"sha256={digest}"
+            row[2] = str(len(data))
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(rows)
+    record_path.write_text(out.getvalue())
+    print(f"normalized sbsa platform tag: {wheel}")
+FIXSBSA
+
+RUN python -m pip check
 
 RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
  && local_nccl=/opt/libnccl-local-inference.so.2.30.4 \
@@ -769,8 +797,34 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       "nvidia-cutlass-dsl[cu13]==4.5.2" \
       "transformers>=5.5.1" \
       "apache-tvm-ffi==0.1.9" \
-      "fastsafetensors>=0.3.2" \
- && /opt/venv/bin/python -m pip check
+      "fastsafetensors>=0.3.2"
+
+# Same sbsa platform-tag normalization as the build base (see comment there);
+# packages installed above may pull fresh NVIDIA aarch64 wheels. No-op on x86.
+RUN /opt/venv/bin/python - <<'FIXSBSA'
+import base64, csv, glob, hashlib, io, pathlib
+
+for wheel in glob.glob("/opt/venv/lib/python*/site-packages/*.dist-info/WHEEL"):
+    path = pathlib.Path(wheel)
+    text = path.read_text()
+    if "manylinux2014_sbsa" not in text:
+        continue
+    path.write_text(text.replace("manylinux2014_sbsa", "manylinux2014_aarch64"))
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    record_path = path.parent / "RECORD"
+    rows = list(csv.reader(io.StringIO(record_path.read_text())))
+    for row in rows:
+        if row and row[0].endswith(".dist-info/WHEEL"):
+            row[1] = f"sha256={digest}"
+            row[2] = str(len(data))
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(rows)
+    record_path.write_text(out.getvalue())
+    print(f"normalized sbsa platform tag: {wheel}")
+FIXSBSA
+
+RUN /opt/venv/bin/python -m pip check
 
 RUN if [[ -n "${INSTANTTENSOR_REF}" ]]; then \
       git clone --recursive "${INSTANTTENSOR_REPO}" /tmp/instanttensor-src; \
