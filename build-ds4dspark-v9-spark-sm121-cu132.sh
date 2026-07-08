@@ -69,12 +69,14 @@ export DEEPGEMM_REF="${DEEPGEMM_REF:-${DEEPGEMM_COMMIT}}"
 export DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE:-deepgemm-sm121-mqa-logits-arch-number-20260708.patch}"
 
 export B12X_REPO="${B12X_REPO:-https://github.com/lukealonso/b12x.git}"
-export B12X_REF="${B12X_REF:-master}"
+# master has moved past the v9 pin; fetch the pinned commit directly.
 export B12X_COMMIT="${B12X_COMMIT:-f3686b555d639823b276c2080f173145eed7f007}"
+export B12X_REF="${B12X_REF:-${B12X_COMMIT}}"
 
 export VLLM_REPO="${VLLM_REPO:-https://github.com/local-inference-lab/vllm.git}"
-export VLLM_REF="${VLLM_REF:-dev/eldritch-enlightenment}"
+# dev/eldritch-enlightenment has moved past the v9 pin; check out the commit.
 export VLLM_COMMIT="${VLLM_COMMIT:-45c1582e9b80ba83e71c3a6458e71da4736fbdc4}"
+export VLLM_REF="${VLLM_REF:-${VLLM_COMMIT}}"
 export VLLM_PATCH_URL="${VLLM_PATCH_URL:-}"
 export VLLM_PATCH_SHA256="${VLLM_PATCH_SHA256:-}"
 export VLLM_PATCH_FILE="${VLLM_PATCH_FILE:-vllm-b12x-indexer-warmup-fallback-20260704.patch}"
