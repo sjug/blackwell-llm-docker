@@ -863,6 +863,11 @@ PY
 # stage starts FROM the system base, which only ships the local-inference
 # copy. Materialize /opt/libnccl.so.2.30.4 first so the symlink resolves,
 # then run the existence checks.
+#
+# The torch-bundled NCCL backup must NOT live inside nvidia/nccl/lib: torch's
+# CUDA-deps preloader globs that directory (libnccl.so.*) in arbitrary
+# directory order and can dlopen the 2.29.7 backup instead of the patched
+# 2.30.4 symlink. Keep the backup in /opt instead.
 RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
  && local_nccl=/opt/libnccl-local-inference.so.2.30.4 \
  && normal_nccl=/opt/libnccl.so.2.30.4 \
@@ -870,7 +875,8 @@ RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so
  && if [[ ! -e "${normal_nccl}" ]]; then cp -aL "${local_nccl}" "${normal_nccl}"; fi \
  && test -e "${torch_nccl}" \
  && if [[ ! -e "${local_nccl}.orig" ]]; then cp -aL "${local_nccl}" "${local_nccl}.orig"; fi \
- && if [[ ! -e "${torch_nccl}.torch-bundled-2.29.7" ]]; then cp -aL "${torch_nccl}" "${torch_nccl}.torch-bundled-2.29.7"; fi \
+ && if [[ ! -e "${torch_nccl}.torch-bundled-2.29.7" && ! -e /opt/libnccl-torch-bundled-2.29.7.orig ]]; then cp -aL "${torch_nccl}" /opt/libnccl-torch-bundled-2.29.7.orig; fi \
+ && if [[ -e "${torch_nccl}.torch-bundled-2.29.7" ]]; then mv "${torch_nccl}.torch-bundled-2.29.7" /opt/libnccl-torch-bundled-2.29.7.orig; fi \
  && readelf -d "${normal_nccl}" | grep -F 'Library soname: [libnccl.so.2]' \
  && ln -sfn "${normal_nccl}" "${local_nccl}" \
  && ln -sfn "${normal_nccl}" /opt/libnccl.so.2 \
