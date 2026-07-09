@@ -858,12 +858,17 @@ import instanttensor
 print("instanttensor", md.version("instanttensor"), instanttensor.__file__)
 PY
 
+# The venv copied from vllm-build has the torch libnccl path already
+# symlinked to /opt/libnccl.so.2.30.4 (build-base did the surgery), but this
+# stage starts FROM the system base, which only ships the local-inference
+# copy. Materialize /opt/libnccl.so.2.30.4 first so the symlink resolves,
+# then run the existence checks.
 RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
  && local_nccl=/opt/libnccl-local-inference.so.2.30.4 \
  && normal_nccl=/opt/libnccl.so.2.30.4 \
- && test -e "${torch_nccl}" \
  && test -e "${local_nccl}" \
  && if [[ ! -e "${normal_nccl}" ]]; then cp -aL "${local_nccl}" "${normal_nccl}"; fi \
+ && test -e "${torch_nccl}" \
  && if [[ ! -e "${local_nccl}.orig" ]]; then cp -aL "${local_nccl}" "${local_nccl}.orig"; fi \
  && if [[ ! -e "${torch_nccl}.torch-bundled-2.29.7" ]]; then cp -aL "${torch_nccl}" "${torch_nccl}.torch-bundled-2.29.7"; fi \
  && readelf -d "${normal_nccl}" | grep -F 'Library soname: [libnccl.so.2]' \
