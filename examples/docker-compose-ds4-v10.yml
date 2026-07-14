@@ -1,0 +1,40 @@
+services:
+  ds4:
+    image: ${IMAGE:-voipmonitor/vllm:fathomless-firmament-v16-vllm8f86f42-b12xfe06f49-fi801d57a-cu132-20260714}
+    entrypoint: ["/usr/local/bin/serve-fathomless-firmament.sh"]
+    network_mode: host
+    ipc: host
+    shm_size: 32gb
+    gpus: all
+    environment:
+      MODEL_FAMILY: ds4
+      CUDA_VISIBLE_DEVICES: ${GPUS:-0,1}
+      PORT: ${PORT:-8000}
+      STANDARD_MODEL: ${STANDARD_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
+      DSPARK_MODEL: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
+      MODE: ${MODE:-dspark}
+      BACKEND: ${BACKEND:-lucifer-cutlass}
+      TP_SIZE: ${TP_SIZE:-2}
+      DCP_SIZE: ${DCP_SIZE:-1}
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-64}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
+      MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
+      LOAD_FORMAT: ${LOAD_FORMAT:-instanttensor}
+      INSTANTTENSOR_BACKEND: ${INSTANTTENSOR_BACKEND:-BUFFERED}
+      ALLREDUCE_MODE: ${ALLREDUCE_MODE:-b12x}
+      INDEXER_BACKEND: ${INDEXER_BACKEND:-auto}
+      B12X_PCIE_DMA: ${B12X_PCIE_DMA:-0}
+      DSPARK_TOKENS: ${DSPARK_TOKENS:-5}
+      DSPARK_CAPACITY: ${DSPARK_CAPACITY:-0}
+      DSPARK_CAPACITY_VERIFICATION_MODE: ${DSPARK_CAPACITY_VERIFICATION_MODE:-}
+      DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: ${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}
+      DSPARK_DYNAMIC_DRAFT_DEPTH: ${DSPARK_DYNAMIC_DRAFT_DEPTH:-0}
+      DSPARK_ONLINE_STS: ${DSPARK_ONLINE_STS:-1}
+      DSPARK_SPS_CURVE: ${DSPARK_SPS_CURVE:-auto}
+      DSPARK_FP8_DRAFT_HEAD: ${DSPARK_FP8_DRAFT_HEAD:-0}
+      DSPARK_DRAFT_ATTENTION_BACKEND: ${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}
+    volumes:
+      - ${HF_CACHE:-/root/.cache/huggingface}:/root/.cache/huggingface
+      - ${MODEL_ROOT:-/root/models}:/root/models:ro
+      - ${JIT_CACHE:-./cache/ds4-v10}:/cache
+      - ${CONTAINER_TMP:-./cache/ds4-v10/tmp}:/container-tmp

@@ -52,6 +52,7 @@ ARG VLLM_PATCH_SHA256=
 ARG LAUNCHER_REPO=https://github.com/local-inference-lab/vllm.git
 ARG LAUNCHER_REF=dev/black-benediction
 ARG LAUNCHER_COMMIT=
+ARG VLLM_REQUIRED_LAUNCHERS=
 ARG INSTANTTENSOR_REPO=https://github.com/scitix/InstantTensor.git
 ARG INSTANTTENSOR_REF=main
 ARG INSTANTTENSOR_COMMIT=
@@ -531,6 +532,7 @@ ARG VLLM_BUILD_VERSION
 ARG LAUNCHER_REPO
 ARG LAUNCHER_REF
 ARG LAUNCHER_COMMIT
+ARG VLLM_REQUIRED_LAUNCHERS
 ARG VLLM_MAX_JOBS
 ARG VLLM_NVCC_THREADS
 ARG TRITON_KERNELS_REPO
@@ -669,6 +671,8 @@ if os.environ.get("TRITON_KERNELS_REF"):
     importlib.import_module("vllm.third_party.triton_kernels.matmul_ogs")
 PY
 
+COPY launchers/ /tmp/build-launchers/
+
 RUN launcher_root=/opt/vllm \
  && if [[ ! -f "${launcher_root}/scripts/run-glm51-vllm" && ! -f "${launcher_root}/serve-glm51.sh" ]]; then \
       git clone --filter=blob:none "${LAUNCHER_REPO}" /tmp/vllm-launchers; \
@@ -679,6 +683,9 @@ RUN launcher_root=/opt/vllm \
       cd /opt/vllm; \
     fi \
  && for script in "${launcher_root}"/serve-*.sh; do \
+      if [[ -f "${script}" ]]; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
+    done \
+ && for script in /tmp/build-launchers/serve-*.sh; do \
       if [[ -f "${script}" ]]; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
     done \
  && if [[ -f "${launcher_root}/scripts/run-glm51-vllm" ]]; then \
@@ -699,8 +706,17 @@ RUN launcher_root=/opt/vllm \
       printf '%s\n' '#!/usr/bin/env bash' 'echo "Kimi launcher is not available in this vLLM ref" >&2' 'exit 2' > /usr/local/bin/run-kimi26-vllm; \
       chmod 0755 /usr/local/bin/run-kimi26-vllm; \
     fi \
+ && for required_launcher in ${VLLM_REQUIRED_LAUNCHERS}; do \
+      test -x "/usr/local/bin/${required_launcher}" || { \
+        echo "ERROR: required launcher ${required_launcher} was not installed" >&2; \
+        exit 1; \
+      }; \
+    done \
  && bash -n /usr/local/bin/run-glm51-vllm \
- && bash -n /usr/local/bin/run-kimi26-vllm
+ && bash -n /usr/local/bin/run-kimi26-vllm \
+ && for script in /usr/local/bin/serve-*.sh; do \
+      if [[ -f "${script}" ]]; then bash -n "${script}"; fi; \
+    done
 
 RUN <<'SH' bash -eux
 cat > /usr/local/bin/verify-vllm-b12x-cu132 <<'VERIFY'
@@ -712,6 +728,9 @@ test -x /usr/local/bin/run-glm51-vllm
 test -x /usr/local/bin/run-kimi26-vllm
 bash -n /usr/local/bin/run-glm51-vllm
 bash -n /usr/local/bin/run-kimi26-vllm
+for script in /usr/local/bin/serve-*.sh; do
+  if [[ -f "${script}" ]]; then bash -n "${script}"; fi
+done
 python - <<'PY'
 import importlib.metadata as md
 import importlib.util
@@ -741,6 +760,7 @@ RUN python -m pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu
  && python -m pip cache purge || true \
  && rm -rf /tmp/flashinfer-src /tmp/flashinfer-wheels /root/.cache/pip /tmp/pip-* \
  && rm -rf /tmp/vllm-launchers \
+ && rm -rf /tmp/build-launchers \
  && rm -rf \
       /opt/vllm/.deps \
       /opt/vllm/.git \
@@ -770,6 +790,7 @@ COPY --from=vllm-build /usr/local/bin/serve-*.sh /usr/local/bin/
 COPY --from=vllm-build /usr/local/bin/verify-vllm-b12x-cu132 /usr/local/bin/verify-vllm-b12x-cu132
 
 ARG HUMMING_KERNELS_SPEC="humming-kernels[cu13]==0.1.4"
+ARG VLLM_RUNTIME_EXTRA_PACKAGES=""
 ARG INSTANTTENSOR_REPO
 ARG INSTANTTENSOR_REF
 ARG INSTANTTENSOR_COMMIT
@@ -807,10 +828,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       "nvidia-cutlass-dsl[cu13]==4.5.2" \
       "transformers>=5.5.1" \
       "apache-tvm-ffi==0.1.9" \
-      "fastsafetensors>=0.3.2"
+      "fastsafetensors>=0.3.2" \
+ && if [[ -n "${VLLM_RUNTIME_EXTRA_PACKAGES}" ]]; then \
+      /opt/venv/bin/python -m pip install --upgrade \
+        --index-url https://download.pytorch.org/whl/cu132 \
+        --extra-index-url https://pypi.org/simple \
+        --constraint /tmp/torch-cu132-constraints.txt \
+        ${VLLM_RUNTIME_EXTRA_PACKAGES}; \
+    fi
 
 # Same sbsa platform-tag normalization as the build base (see comment there);
-# packages installed above may pull fresh NVIDIA aarch64 wheels. No-op on x86.
+# packages installed above (including VLLM_RUNTIME_EXTRA_PACKAGES) may pull
+# fresh NVIDIA aarch64 wheels. No-op on x86. The pip check that upstream runs
+# inside the install step happens after normalization instead.
 RUN /opt/venv/bin/python - <<'FIXSBSA'
 import base64, csv, glob, hashlib, io, pathlib
 
@@ -990,6 +1020,7 @@ ARG TRITON_KERNELS_REF
 ARG TRITON_KERNELS_COMMIT
 ARG INSTANTTENSOR_REF
 ARG INSTANTTENSOR_COMMIT
+ARG VLLM_REQUIRED_LAUNCHERS
 ARG CUBLAS_CUDA13_VERSION
 ARG CUDNN_CUDA13_VERSION
 ARG CUDA_COMPAT_13_2_VERSION
@@ -1019,4 +1050,5 @@ LABEL org.opencontainers.image.description="Clean CUDA 13.2.1 vLLM+B12X image wi
       local-inference.triton_kernels.branch="${TRITON_KERNELS_REF}" \
       local-inference.triton_kernels.commit="${TRITON_KERNELS_COMMIT}" \
       local-inference.instanttensor.branch="${INSTANTTENSOR_REF}" \
-      local-inference.instanttensor.commit="${INSTANTTENSOR_COMMIT}"
+      local-inference.instanttensor.commit="${INSTANTTENSOR_COMMIT}" \
+      local-inference.launchers="${VLLM_REQUIRED_LAUNCHERS}"
