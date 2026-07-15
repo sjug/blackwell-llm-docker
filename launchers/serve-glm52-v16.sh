@@ -16,6 +16,7 @@ DCP="${DCP:-1}"
 DCP_BACKEND="${DCP_BACKEND:-a2a}"
 DCP_A2A_MAX_TOKENS="${DCP_A2A_MAX_TOKENS:-64}"
 DCP_A2A_LARGE_BACKEND="${DCP_A2A_LARGE_BACKEND:-ag_rs}"
+DCP_PREFILL_WORKSPACE="${DCP_PREFILL_WORKSPACE:-auto}"
 MTP="${MTP:-0}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 GRAPH="${GRAPH:-$((MAX_NUM_SEQS * 4))}"
@@ -35,6 +36,7 @@ LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
 QUANTIZATION="${QUANTIZATION:-modelopt_fp4}"
 QUANTIZATION_CONFIG_JSON="${QUANTIZATION_CONFIG_JSON:-}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 GLM52_INDEX_TOPK_PATTERN="${GLM52_INDEX_TOPK_PATTERN:-FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS}"
 
 case "${MOE_MODE}" in
@@ -65,9 +67,19 @@ case "${B12X_PCIE_DMA}" in
   *) die "B12X_PCIE_DMA must be 0 or 1" ;;
 esac
 
+case "${KV_CACHE_DTYPE}" in
+  fp8|fp8_ds_mla|nvfp4_ds_mla) ;;
+  *) die "KV_CACHE_DTYPE must be fp8, fp8_ds_mla, or nvfp4_ds_mla" ;;
+esac
+
 case "${DCP_A2A_LARGE_BACKEND}" in
   ag_rs|a2a) ;;
   *) die "DCP_A2A_LARGE_BACKEND must be ag_rs or a2a" ;;
+esac
+
+case "${DCP_PREFILL_WORKSPACE}" in
+  auto|0|1) ;;
+  *) die "DCP_PREFILL_WORKSPACE must be auto, 0, or 1" ;;
 esac
 
 case "${MOE_BACKEND}" in
@@ -88,6 +100,18 @@ esac
 [[ "${MAX_NUM_SEQS}" =~ ^[0-9]+$ ]] || die "MAX_NUM_SEQS must be an integer"
 [[ "${GRAPH}" =~ ^[0-9]+$ ]] || die "GRAPH must be an integer"
 [[ "${#GLM52_INDEX_TOPK_PATTERN}" -eq 78 ]] || die "GLM52_INDEX_TOPK_PATTERN must be exactly 78 characters, got ${#GLM52_INDEX_TOPK_PATTERN}"
+
+if [[ "${DCP_PREFILL_WORKSPACE}" == "auto" ]]; then
+  case "${TP}:${DCP}" in
+    4:4|6:2|6:3|6:6|8:2|8:4|8:8) DCP_PREFILL_WORKSPACE=1 ;;
+    *) DCP_PREFILL_WORKSPACE=0 ;;
+  esac
+fi
+
+DCP_PROJECT_MIN_PREFILL_TOKENS=1024
+if ((GRAPH > DCP_PROJECT_MIN_PREFILL_TOKENS)); then
+  DCP_PROJECT_MIN_PREFILL_TOKENS="${GRAPH}"
+fi
 
 if [[ -z "${ONLINE_QUANT}" ]]; then
   enabled_quant_aliases=0
@@ -164,6 +188,9 @@ export VLLM_USE_B12X_SPARSE_INDEXER=1
 export VLLM_USE_B12X_DCP_A2A=1
 export VLLM_DCP_A2A_MAX_TOKENS="${DCP_A2A_MAX_TOKENS}"
 export VLLM_DCP_A2A_LARGE_BACKEND="${DCP_A2A_LARGE_BACKEND}"
+export VLLM_DCP_PROJECT_BEFORE_MERGE="${DCP_PREFILL_WORKSPACE}"
+export VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS="${DCP_PROJECT_MIN_PREFILL_TOKENS}"
+export VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE="${DCP_PREFILL_WORKSPACE}"
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_ENABLE_PCIE_ALLREDUCE=1
 export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
@@ -223,7 +250,10 @@ if [[ "${LINEAR_BACKEND}" != "auto" ]]; then
   linear_args=(--linear-backend "${LINEAR_BACKEND}")
 fi
 
-quant_args=(--quantization "${QUANTIZATION}")
+quant_args=()
+if [[ -n "${QUANTIZATION}" && "${QUANTIZATION}" != "auto" && "${QUANTIZATION}" != "none" ]]; then
+  quant_args+=(--quantization "${QUANTIZATION}")
+fi
 if [[ "${ONLINE_QUANT}" != "none" ]]; then
   quant_args+=(--quantization-config "${QUANTIZATION_CONFIG_JSON}")
 fi
@@ -243,7 +273,7 @@ cmd=(vllm serve "${MODEL}" \
   --trust-remote-code \
   --tensor-parallel-size "${TP}" \
   "${dcp_args[@]}" \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --attention-backend B12X_MLA_SPARSE \
   --moe-backend "${MOE_BACKEND}" \
   "${linear_args[@]}" \
@@ -274,7 +304,12 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf 'B12X_MOE_FORCE_A8=%q\n' "${B12X_MOE_FORCE_A8}"
   printf 'B12X_MOE_FORCE_A16=%q\n' "${B12X_MOE_FORCE_A16}"
   printf 'VLLM_USE_B12X_PCIE_DMA=%q\n' "${VLLM_USE_B12X_PCIE_DMA}"
+  printf 'VLLM_DCP_PROJECT_BEFORE_MERGE=%q\n' "${VLLM_DCP_PROJECT_BEFORE_MERGE}"
+  printf 'VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS=%q\n' "${VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS}"
+  printf 'VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE=%q\n' "${VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE}"
   printf 'INSTANTTENSOR_BACKEND=%q\n' "${INSTANTTENSOR_BACKEND}"
+  printf 'KV_CACHE_DTYPE=%q\n' "${KV_CACHE_DTYPE}"
+  printf 'QUANTIZATION=%q\n' "${QUANTIZATION}"
   printf 'Command:'
   printf ' %q' "${cmd[@]}"
   printf '\n'

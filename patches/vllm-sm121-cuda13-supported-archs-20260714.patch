@@ -1,0 +1,29 @@
+vLLM CMake: add 12.1 to CUDA_SUPPORTED_ARCHS on the CUDA >= 13 path.
+
+With TORCH_CUDA_ARCH_LIST=12.1a (DGX Spark GB10, SM121) and CUDA 13.x,
+cuda_archs_loose_intersection(SUPPORTED, "12.1a") finds no 12.1 base entry,
+so the highest-arch-below fallback collapses the build to plain "12.0"
+("CUDA supported target architectures: 12.0"). Base extension sources then
+compile for a non arch-specific SM120 target and the v17 NVFP4 KV-cache
+additions to csrc/libtorch_stable/cache_kernels.cu fail at ptxas:
+  Feature 'cvt.e2m1x2.f32' not supported on .target 'sm_120'
+With 12.1 present the symmetric suffix match preserves "12.1a", so all
+SM12x kernel groups (including the "12.0f"-keyed FP4 group, via the family
+fallback that returns the target's own entry) resolve to native sm_121a.
+No effect on x86 builds: 12.0a still matches through the 12.0 entry.
+
+Applies to local-inference-lab/vllm
+codex/fathomless-firmament-v17-dcp-prefill-opt-20260714 @ 6ccc3eb.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -109,7 +109,7 @@
+    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
+    # to support the whole generation without specifying all sub-architectures
+    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
