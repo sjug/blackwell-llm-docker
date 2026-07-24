@@ -5,6 +5,7 @@ IMAGE="${IMAGE:-voipmonitor/vllm:vllm-b12x-cu132}"
 # Container engine: docker (default) or podman. Rootless podman works; all
 # build stages are compile-only and do not need GPU access.
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile.vllm-b12x-cu132}"
 # CUDA target archs. Defaults are the historical SM120 x86_64 values; for
 # GB10 / DGX Spark (SM121) use 12.1a / 121a / 12.1a (FlashInfer refuses to
 # run SM120 cubins on SM121 and only enables its sm121 AOT modules when
@@ -30,6 +31,7 @@ FLASHINFER_BUILD_CUBIN="${FLASHINFER_BUILD_CUBIN:-1}"
 DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}"
 DEEPGEMM_REF="${DEEPGEMM_REF:-refs/pull/324/head}"
 DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE:-}"
+B12X_PATCH_FILE="${B12X_PATCH_FILE:-}"
 B12X_REPO="${B12X_REPO:-https://github.com/lukealonso/b12x.git}"
 B12X_REF="${B12X_REF:-refs/pull/11/head}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/local-inference-lab/vllm.git}"
@@ -117,6 +119,7 @@ echo "  FLASHINFER_REF=${FLASHINFER_REF} ${FLASHINFER_COMMIT}"
 echo "  FLASHINFER_BUILD_CUBIN=${FLASHINFER_BUILD_CUBIN}"
 echo "  DEEPGEMM_REF=${DEEPGEMM_REF} ${DEEPGEMM_COMMIT}"
 echo "  DEEPGEMM_PATCH_FILE=${DEEPGEMM_PATCH_FILE}"
+echo "  B12X_PATCH_FILE=${B12X_PATCH_FILE}"
 echo "  B12X_REF=${B12X_REF} ${B12X_COMMIT}"
 echo "  VLLM_REF=${VLLM_REF} ${VLLM_COMMIT}"
 echo "  VLLM_PATCH_URL=${VLLM_PATCH_URL}"
@@ -149,7 +152,7 @@ if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
     --build-arg NCCL_REF="${NCCL_REF}" \
     --build-arg NCCL_COMMIT="${NCCL_COMMIT}" \
     "${PROGRESS_ARGS[@]}" \
-    -f Dockerfile.vllm-b12x-cu132 \
+    -f "${DOCKERFILE}" \
     -t "${SYSTEM_BASE_IMAGE}" \
     "$@" \
     .
@@ -161,7 +164,7 @@ if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
     --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
     --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
     "${PROGRESS_ARGS[@]}" \
-    -f Dockerfile.vllm-b12x-cu132 \
+    -f "${DOCKERFILE}" \
     -t "${BUILD_BASE_IMAGE_TAG}" \
     "$@" \
     .
@@ -193,6 +196,7 @@ DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
   --build-arg DEEPGEMM_REF="${DEEPGEMM_REF}" \
   --build-arg DEEPGEMM_COMMIT="${DEEPGEMM_COMMIT}" \
   --build-arg DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE}" \
+  --build-arg B12X_PATCH_FILE="${B12X_PATCH_FILE}" \
   --build-arg B12X_REPO="${B12X_REPO}" \
   --build-arg B12X_REF="${B12X_REF}" \
   --build-arg B12X_COMMIT="${B12X_COMMIT}" \
@@ -219,7 +223,7 @@ DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
   --build-arg HUMMING_KERNELS_SPEC="${HUMMING_KERNELS_SPEC}" \
   --build-arg VLLM_RUNTIME_EXTRA_PACKAGES="${VLLM_RUNTIME_EXTRA_PACKAGES}" \
   "${PROGRESS_ARGS[@]}" \
-  -f Dockerfile.vllm-b12x-cu132 \
+  -f "${DOCKERFILE}" \
   -t "${IMAGE}" \
   "$@" \
   .

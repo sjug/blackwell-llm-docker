@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Clean vLLM+B12X image for Blackwell on CUDA 13.2.
+# Clean vLLM+SparkInfer image for Blackwell on CUDA 13.2.
+# (v20 lineage: the B12X project was renamed SparkInfer with a namespaced
+# source tree and dist name 'sparkinfer'. B12X_* build args and image labels
+# are kept for pipeline continuity; runtime B12X_* envs have upstream shims.)
 #
 # Source stack:
 #   NVIDIA CUDA 13.2.1 cuDNN devel base
@@ -753,7 +756,8 @@ print("torch nccl", torch.cuda.nccl.version())
 print("flashinfer", getattr(flashinfer, "__version__", "unknown"))
 print("deep_gemm", getattr(deep_gemm, "__version__", md.version("deep_gemm")))
 print("vllm", getattr(vllm, "__version__", "unknown"))
-print("b12x", md.version("b12x"))
+import sparkinfer  # noqa: F401  (dist renamed from b12x in v20)
+print("sparkinfer", md.version("sparkinfer"))
 spec = importlib.util.find_spec("vllm._rust_tool_parser")
 assert spec is not None, "vllm._rust_tool_parser missing"
 print("rust_tool_parser", spec.origin)
