@@ -1,0 +1,96 @@
+{
+  "base": {
+    "commit": "9cebd405d0caf4bebe01d694b5a8bf4e3e354314",
+    "ref": "refs/heads/release/v0.5.2-glm52-dcp-base",
+    "repository": "https://github.com/local-inference-lab/LMCache.git"
+  },
+  "manifest": {
+    "sha256": "89df49b01c9b077898a7141ac86581887a3b1e2bada744e8c891213e7d0caa03"
+  },
+  "name": "gilded-gnosis-v20-lmcache",
+  "pull_requests": [
+    {
+      "disposition": "merged",
+      "head": "7b7583aef55e98ba05a6c199e71601d78552e794",
+      "number": 7,
+      "ref": "refs/pull/7/head",
+      "title": "Return bounded LMCache MP RPC handler errors"
+    },
+    {
+      "disposition": "merged",
+      "head": "31c4175d2134518e5b43fe8f4a7d072df6043a13",
+      "number": 8,
+      "ref": "refs/pull/8/head",
+      "title": "Recover failed MP retrieves by recomputing invalid blocks"
+    },
+    {
+      "disposition": "merged",
+      "head": "c3b73de74d855f6263deea8b6c6c4dde87e6e5b9",
+      "number": 9,
+      "ref": "refs/pull/9/head",
+      "title": "Restore the largest exact L1 prefix after allocation failure"
+    },
+    {
+      "disposition": "merged",
+      "head": "59186798bb5859b7add7bcac81dff9f2fd4037ab",
+      "number": 10,
+      "ref": "refs/pull/10/head",
+      "title": "Protect native lookup keys from concurrent deletion"
+    },
+    {
+      "disposition": "merged",
+      "head": "2cee5a2c1ef7e80028e94b1bc4bfbfc02e2c2a8d",
+      "number": 11,
+      "ref": "refs/pull/11/head",
+      "title": "Log bounded prefetch failure key samples"
+    },
+    {
+      "disposition": "merged",
+      "head": "baf1345106ebe568a116a35fdcee36bfec73da57",
+      "number": 12,
+      "ref": "refs/pull/12/head",
+      "title": "Return native per-key store results"
+    },
+    {
+      "disposition": "merged",
+      "head": "d4dce69bf90362953cf9ac9a86cccc186b3219dc",
+      "number": 13,
+      "ref": "refs/pull/13/head",
+      "title": "Enforce native filesystem O_DIRECT alignment"
+    },
+    {
+      "disposition": "merged",
+      "head": "502b3c60f2e61625d6e32a31d0d725eedc620792",
+      "number": 14,
+      "ref": "refs/pull/14/head",
+      "title": "Support current and legacy native filesystem object-group keys"
+    },
+    {
+      "disposition": "merged",
+      "head": "7892d42a6996df855fe743edb271fa154503bef8",
+      "number": 15,
+      "ref": "refs/pull/15/head",
+      "title": "Make native stores durable before reporting completion"
+    },
+    {
+      "disposition": "merged",
+      "head": "e6c2708fe8ae8a96d3c66e83bf4b548c734fbb13",
+      "number": 16,
+      "ref": "refs/pull/16/head",
+      "title": "Restore native filesystem capacity accounting after restart"
+    },
+    {
+      "disposition": "merged",
+      "head": "f9639e2094f70955a1145bfd7219b6fdd39ee143",
+      "number": 17,
+      "ref": "refs/pull/17/head",
+      "title": "Add bounded L1 writeback to durable storage"
+    }
+  ],
+  "result": {
+    "patch": "integration.patch",
+    "patch_sha256": "34a0b73b2603ce2fb8c6d9383551871e23981ff2c0b837c000961c38afe73337",
+    "tree": "a5aa59cc8edca462a3f4c198d17fd2b9c1a7ffaa"
+  },
+  "schema_version": 1
+}
