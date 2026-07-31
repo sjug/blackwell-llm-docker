@@ -40,8 +40,8 @@
  ],
  "result": {
   "patch": "integration.patch",
-  "patch_sha256": "8e2916ec1b51b4d12861f4cfaf2fd04ed463cc63feb2aae28cb13ce383207281",
-  "tree": "6dbe127ee72cc394441a047bf2f288ba058f5ba3"
+  "patch_sha256": "5747e36bbdf5f9d81e1151db91b58643324a615313e4a95c266a73ccd2b1dc69",
+  "tree": "9e70264d9e2c8654a16537afe8c2b9724c869ea6"
  },
  "schema_version": 1,
  "spark_overlay": {
@@ -53,7 +53,8 @@
   "sm121_patches": [
    "vllm-sm121-cuda13-supported-archs (CMakeLists CUDA>=13 adds 12.1)",
    "vllm-mhc-broadcast-customop-20260722 (register mhc_pre_broadcast_tilelang)",
-   "vllm-mtp-mhc-3d-fallback-20260722 (b12x residual-None 3D MTP path)"
+   "vllm-mtp-mhc-3d-fallback-20260722 (b12x residual-None 3D MTP path)",
+   "vllm-flashinfer-autotune-skip-attn-20260731 (profiling-phase kernel warmup predates block_tables; pass skip_attn=True in flashinfer_autotune dummy runs)"
   ]
  }
 }

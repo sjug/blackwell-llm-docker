@@ -3850,6 +3850,31 @@ index 86dc72de7..be0c6fba8 100644
  
  def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
      """
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index 36a17fa8a..c04a02aee 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -479,6 +479,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+                 num_tokens=runner.scheduler_config.max_num_batched_tokens,
+                 skip_eplb=True,
+                 is_profile=True,
++                # Kernel warmup runs inside the memory-profiling phase, before
++                # KV-cache init creates runner.block_tables; dummy attention
++                # tables cannot be prepared yet (skip_attn exists exactly for
++                # initial-profiling dummy runs).
++                skip_attn=True,
+             )
+         get_world_group().barrier()
+         return
+@@ -498,6 +503,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+         num_tokens=runner.scheduler_config.max_num_batched_tokens,
+         skip_eplb=True,
+         is_profile=True,
++        # See above: profiling-phase warmup precedes block_tables creation.
++        skip_attn=True,
+     )
+ 
+     with torch.inference_mode():
 diff --git a/vllm/models/deepseek_v32/nvidia/attention.py b/vllm/models/deepseek_v32/nvidia/attention.py
 index dcf955ad5..320d7251f 100644
 --- a/vllm/models/deepseek_v32/nvidia/attention.py

@@ -497,9 +497,16 @@ RUN CUTLASS_DSL="$(python -c 'import cutlass.utils.blockscaled_layout as m; prin
  && cp /build/cutlass/python/CuTeDSL/cutlass/utils/blockscaled_layout.py "${CUTLASS_DSL}" \
  && python -c 'from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa; print("OK: sm120_make_smem_layout_sfa available")'
 
+# Pin build-stage tvm-ffi to the runtime version: downstream stages (the
+# XGrammar source build in particular) link native bindings against
+# whatever libtvm_ffi is present here, while the final stage installs
+# apache-tvm-ffi==TVM_FFI_VERSION. The upstream ">=0.1.6" floats to the
+# newest release, which produced xgrammar bindings importing
+# TVMFFIGetCustomAllocator (0.1.13 ABI) that the 0.1.10 runtime lacks.
+ARG TVM_FFI_VERSION
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install \
-      "apache-tvm-ffi>=0.1.6" \
+      "apache-tvm-ffi==${TVM_FFI_VERSION}" \
       "nvidia-cudnn-frontend>=1.13.0" \
       packaging \
       pynvml \

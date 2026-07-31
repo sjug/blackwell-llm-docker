@@ -283,6 +283,12 @@ assert flashinfer.__version__.startswith("0.6.15"), flashinfer.__version__
 assert md.version("sparkinfer") == "1.0.1"
 assert md.version("xgrammar") == "0.2.5"
 assert md.version("lmcache").startswith("0.5.2"), md.version("lmcache")
+# Import the native bindings, not just the dist metadata: the v20p2.0 build
+# shipped xgrammar bindings linked against a newer build-stage tvm-ffi ABI
+# (TVMFFIGetCustomAllocator) that the pinned runtime lacked — version
+# metadata passed while `vllm serve` died on symbol lookup.
+import xgrammar  # noqa: F401
+import lmcache  # noqa: F401
 assert hasattr(envs, "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH")
 assert hasattr(envs, "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS")
 
