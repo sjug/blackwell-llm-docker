@@ -1,0 +1,99 @@
+{
+ "base": {
+  "commit": "30038602b71395f481ef4a6edfe4fcf8551d9c15",
+  "ref": "refs/heads/dev/gilded-gnosis",
+  "repository": "https://github.com/local-inference-lab/vllm.git"
+ },
+ "manifest": {
+  "sha256": "25c6cf315003771fcdf9c41ea8ea5ea431950f9f53815a1ec19c5567684cd4b4"
+ },
+ "name": "gilded-gnosis-v20p3p1-spark",
+ "pull_requests": [
+  {
+   "disposition": "merged",
+   "head": "99bf3f13f13012b72d6d67e49572d686b45b2833",
+   "number": 145,
+   "ref": "refs/pull/145/head",
+   "title": "GLM-5.2 calibrated NVFP4 MLA KV outer scales"
+  },
+  {
+   "disposition": "merged",
+   "head": "672aec40dc664de014bd1e92d9a2885d7658c37f",
+   "number": 229,
+   "ref": "refs/pull/229/head",
+   "title": "Harden compressed MLA cache and workspace contracts"
+  },
+  {
+   "disposition": "merged",
+   "head": "5f144274d6e092237f4f4f437b7e9d3aaa427157",
+   "number": 213,
+   "ref": "refs/pull/213/head",
+   "title": "Skip pre-KV V2 attention during FlashInfer autotune"
+  },
+  {
+   "disposition": "merged",
+   "head": "e63a190ee1b48d051ccebce485de343dbe2b3505",
+   "number": 214,
+   "ref": "refs/pull/214/head",
+   "title": "Add DeepSeek-V4-Flash-0731 DSpark profile"
+  },
+  {
+   "disposition": "merged",
+   "head": "c7ac22d5bfe923803cc923f2293085faac7d1dd0",
+   "number": 217,
+   "ref": "refs/pull/217/head",
+   "title": "Harden shared regions for native CPU KV offload"
+  },
+  {
+   "disposition": "merged",
+   "head": "3b89c7a113f92522aa07cc3271422c04e458d771",
+   "number": 218,
+   "ref": "refs/pull/218/head",
+   "title": "Align native SWA/MTP retention and shared-prefix tails"
+  },
+  {
+   "disposition": "merged",
+   "head": "52201611719edf67f18bc0cbec17802880a4afb7",
+   "number": 216,
+   "ref": "refs/pull/216/head",
+   "title": "Isolate semantic PCIe graph channels"
+  },
+  {
+   "disposition": "merged",
+   "head": "1702ed2d28342d84551539f8d7e2de637f7ca04e",
+   "number": 228,
+   "ref": "refs/pull/228/head",
+   "title": "Consolidate r20 EXL3 prefill and online K6 cache"
+  },
+  {
+   "disposition": "merged",
+   "head": "9401f9d8916f3bdf34123d2d493a918b748c8132",
+   "number": 230,
+   "ref": "refs/pull/230/head",
+   "title": "Keep broadcast MHC pre behind the compile boundary"
+  }
+ ],
+ "result": {
+  "patch": "integration.patch",
+  "patch_sha256": "c2332d17d03b5038571593ff856e50de15599d62126acac59cd602301582bd04",
+  "tree": "41ae549887b0f78bb27a8b612184bdbe66ba7cc9"
+ },
+ "schema_version": 1,
+ "spark_overlay": {
+  "derived_from": {
+   "integration_tree": "f5981f14b4d39979bc0d799c020d42002b707257",
+   "release": "gilded-gnosis-v20-r24"
+  },
+  "dropped_since_v20p2": [
+   "mhc-broadcast-customop: upstream vLLM #230 registered the op",
+   "flashinfer-autotune-skip-attn: upstream kernel_warmup passes skip_attn=True",
+   "sparkinfer ultra-tile repin: w4a16 admission rewritten upstream (SI #112); a16 verified at gate"
+  ],
+  "note": "integration.patch = exact r24 composition + SM121/DS4 overlay as one canonical base->tree diff; v20p3p1 adds the flashinfer frozen-q_len guard (EngineDeadError signatures 'planned with 6, got 8'/'got 5' on Laguna dflash 2026-08-03)",
+  "sm121_patches": [
+   "vllm-sm121-cuda13-supported-archs (CMakeLists CUDA>=13 adds 12.1)",
+   "vllm-mtp-mhc-3d-fallback-20260722 (b12x residual-None 3D MTP path)",
+   "vllm-flashinfer-persistent-decode-qlen-guard-20260803 (persistent decode wrapper reuse requires decode_q_len == planned 1+K; reduced-depth decode steps \u2014 spec truncation near max_tokens, fused prefill tails \u2014 take the dynamic wrapper; planned length 1+K must never be conflated with reorder_batch_threshold 1+2K)"
+  ]
+ }
+}
