@@ -1,0 +1,36 @@
+{
+ "base": {
+  "commit": "36cade0bd8d87a26b7eb2fc8cc46188496465a06",
+  "ref": "refs/heads/master",
+  "repository": "https://github.com/local-inference-lab/sparkinfer.git"
+ },
+ "manifest": {
+  "sha256": "00c85ab5d23d720ace006be444e48c91cc4f538981f1400b727edc0b9ff23d1c"
+ },
+ "name": "gilded-gnosis-v20p2-spark-sparkinfer",
+ "pull_requests": [
+  {
+   "disposition": "merged",
+   "head": "06032ce74afba49a683d01339ed2c971568cec3f",
+   "number": 92,
+   "ref": "refs/pull/92/head",
+   "title": "Stabilize Trellis arena memory profiling"
+  }
+ ],
+ "result": {
+  "patch": "integration.patch",
+  "patch_sha256": "385b0ac12518feda78761eff34606a892fcd33299fd1badae3e58ad8cecf675c",
+  "tree": "9c34ff82086a7802786f9eeb4953910ccb535f7d"
+ },
+ "schema_version": 1,
+ "spark_overlay": {
+  "derived_from": {
+   "integration_tree": "a2ea6083713c15dcf7e2d2bcc74fbece837ff84d",
+   "release": "gilded-gnosis-v20-r13"
+  },
+  "note": "integration.patch = exact r13 composition + SM121/DS4 overlay as one canonical base->tree diff",
+  "sm121_patches": [
+   "sparkinfer-w4a16-ultratile-repin-20260730 (fc2 32x512 force-tile bypass, explicit weight_bits)"
+  ]
+ }
+}
