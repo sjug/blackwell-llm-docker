@@ -8,8 +8,11 @@ cd "$(dirname "$0")"
 #
 # = the exact gilded-gnosis-v20 r24 DS4-runtime composition (2026-08-03,
 #   branch build/gilded-gnosis-r21-ds4-runtime-20260802 @ 6d55257) plus:
-#   - FlashInfer 7ad08da (r24 still pins 801d57a; flashinfer-ai#3932 is
-#     still open upstream and the a8 production path depends on it).
+#   - FlashInfer 7ad08da (r24 pins 801d57a, which PREDATES the
+#     flashinfer-ai#3932 merge of 2026-07-31 — stock r24 still ships the
+#     broken NVFP4 arithmetic our gate measures at 0.61x. Drop this
+#     custom pin once upstream GG bumps FlashInfer past the merge; the
+#     arithmetic gate below then verifies the mainline fixes arrived).
 #   - The SM121/DS4 overlay, now reduced to TWO patches inside the vLLM
 #     composite (arch 12.1 + MTP-3D). Upstream r24 absorbed our other
 #     fixes: mHC broadcast custom-op (vLLM #230), autotune skip_attn
@@ -99,6 +102,8 @@ export NCCL_REF="${NCCL_REF:-canonical/cu132-nccl2304-amd-noxml}"
 export NCCL_COMMIT="${NCCL_COMMIT:-dfab7c1ace32da250ba97757879429c341b7bcf9}"
 
 # FlashInfer: sjug mirror of 801d57a + PR#3932 (unchanged from v20p1).
+# PR#3932 MERGED upstream 2026-07-31; keep this pin only until upstream
+# GG's FlashInfer pin advances past the merge.
 export FLASHINFER_REPO="${FLASHINFER_REPO:-https://github.com/sjug/flashinfer.git}"
 export FLASHINFER_COMMIT="${FLASHINFER_COMMIT:-7ad08da11eb5ba3fc92f576905dce3e2cec03313}"
 export FLASHINFER_REF="${FLASHINFER_REF:-${FLASHINFER_COMMIT}}"
