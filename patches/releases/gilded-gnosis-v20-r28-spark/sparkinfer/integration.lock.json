@@ -1,0 +1,33 @@
+{
+  "base": {
+    "commit": "272a84bd97ce791a1e92d1f3a0da3dd5f3c6565f",
+    "ref": "refs/heads/master",
+    "repository": "https://github.com/local-inference-lab/sparkinfer.git"
+  },
+  "manifest": {
+    "sha256": "ce0a46ccbfacbede90c343b79300a5ecacdedb8a205bfdc414f91f8fb4163d53"
+  },
+  "name": "gilded-gnosis-v20-sparkinfer",
+  "pull_requests": [
+    {
+      "disposition": "merged",
+      "head": "35588fb570d23713bcb2a81749d0fdf3c4396ace",
+      "number": 106,
+      "ref": "refs/pull/106/head",
+      "title": "Honor compressed cache physical page stride"
+    },
+    {
+      "disposition": "merged",
+      "head": "c40eb08f1c612816d111a94870fa59e5e7b4acbe",
+      "number": 117,
+      "ref": "refs/pull/117/head",
+      "title": "Make mixed Trellis expert counts runtime-dynamic"
+    }
+  ],
+  "result": {
+    "patch": "integration.patch",
+    "patch_sha256": "5669173aeabc1307e21f427480451c82e34c63d0003c61aebd2e6526b3aee7ae",
+    "tree": "200c1db7ef98ff8bbfd4f621555326e20f42282e"
+  },
+  "schema_version": 1
+}
