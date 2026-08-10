@@ -1,0 +1,3228 @@
+diff --git a/b12x/_lib/dense_gemm.py b/b12x/_lib/dense_gemm.py
+index 1c72c8cbd9017784ab359034595aa01cbd16ea68..818e37b22cfdf9627f98aa0f3a2394380ad91ca8 100644
+--- a/b12x/_lib/dense_gemm.py
++++ b/b12x/_lib/dense_gemm.py
+@@ -630,6 +630,7 @@ class DenseGemmKernel:
+         mxfp6_fmt_b: Optional[str] = None,
+         b_packed: bool = False,
+         plain_fp8: bool = False,
++        fused_quant_bf16: Optional[bool] = None,
+         block_fp8: bool = False,
+     ):
+         # When set, A/B operands are MX codes carried in Float8E4M3FN
+@@ -1884,10 +1885,12 @@ class DenseGemmKernel:
+         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+         if cutlass.const_expr(self.block_fp8):
+             stage_accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+-            c_identity = cute.make_identity_tensor(
++            block_c_identity = cute.make_identity_tensor(
+                 cute.slice_(self.tile_shape_mnk, (None, None, 0))
+             )
+-            coord_mn = _reshape_acc_to_mn(thr_mma.partition_C(c_identity))
++            block_coord_mn = _reshape_acc_to_mn(
++                thr_mma.partition_C(block_c_identity)
++            )
+ 
+         # Cluster/thread sync
+         if cute.size(self.cluster_shape_mnk) > 1:
+@@ -2340,7 +2343,7 @@ class DenseGemmKernel:
+                                 self._accumulate_block_fp8_stage(
+                                     accumulators,
+                                     stage_accumulators,
+-                                    coord_mn,
++                                    block_coord_mn,
+                                     directSFA_mkl,
+                                     directSFB_nkl,
+                                     tile_coord_mnl,
+@@ -2485,7 +2488,7 @@ class DenseGemmKernel:
+                             self._accumulate_block_fp8_stage(
+                                 accumulators,
+                                 stage_accumulators,
+-                                coord_mn,
++                                block_coord_mn,
+                                 directSFA_mkl,
+                                 directSFB_nkl,
+                                 tile_coord_mnl,
+@@ -7094,6 +7097,7 @@ def dense_gemm(
+     x_bf16: Optional[torch.Tensor] = None,
+     w_gscale: Optional[torch.Tensor] = None,
+     plain_fp8: bool = False,
++    row_scale: Optional[torch.Tensor] = None,
+     block_fp8: bool = False,
+ ) -> torch.Tensor:
+     """Execute dense block-scaled GEMM for one expert-major batch stack.
+@@ -7134,6 +7138,11 @@ def dense_gemm(
+     SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
+     and weight dequantization scale.
+ 
++    ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
++    per output row in the epilogue. It replaces a separate ``out.mul_(v)``
++    launch and reproduces that multiply bit-for-bit, including its second
++    rounding to the C dtype. MX-FP6 only.
++
+     ``block_fp8``: accumulate ordinary E4M3 MMA over each K128 block, then
+     apply compact FP32 activation ``[M,K/128]`` and weight
+     ``[N/128,K/128]`` scales before adding it to the final accumulator.
+diff --git a/b12x/attention/_shared/mla/compressed_config.py b/b12x/attention/_shared/mla/compressed_config.py
+index 3d333ba382f7a762d812018a4adf636c4aeb0a20..ac1fb708058a5667a64767b8096b31df1a3508e9 100644
+--- a/b12x/attention/_shared/mla/compressed_config.py
++++ b/b12x/attention/_shared/mla/compressed_config.py
+@@ -22,9 +22,18 @@ def compressed_mla_split_config_for_contract(
+     rows: int,
+     width: int,
+     max_chunks: int | None = None,
++    decode_row_capacity: int | None = None,
+ ) -> SparseMLASplitDecodeConfig:
+     rows = max(int(rows), 1)
+     width = max(int(width), 1)
++    decode_split_max_rows = _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
++    if decode_row_capacity is not None:
++        decode_row_capacity = int(decode_row_capacity)
++        if decode_row_capacity <= 0:
++            raise ValueError(
++                f"decode_row_capacity must be positive, got {decode_row_capacity}"
++            )
++        decode_split_max_rows = max(decode_split_max_rows, decode_row_capacity)
+     chunk_limit = _COMPRESSED_MLA_SPLIT_MAX_CHUNKS
+     if max_chunks is not None:
+         chunk_limit = max(1, min(int(max_chunks), chunk_limit))
+@@ -32,7 +41,7 @@ def compressed_mla_split_config_for_contract(
+     decode_chunks = (
+         width + _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE - 1
+     ) // _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE
+-    if rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS and decode_chunks <= chunk_limit:
++    if rows <= decode_split_max_rows and decode_chunks <= chunk_limit:
+         return SparseMLASplitDecodeConfig(
+             chunk_size=_COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE,
+             num_chunks=decode_chunks,
+@@ -41,10 +50,7 @@ def compressed_mla_split_config_for_contract(
+     wide_decode_chunks = (
+         width + _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE - 1
+     ) // _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE
+-    if (
+-        rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
+-        and wide_decode_chunks <= chunk_limit
+-    ):
++    if rows <= decode_split_max_rows and wide_decode_chunks <= chunk_limit:
+         return SparseMLASplitDecodeConfig(
+             chunk_size=_COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE,
+             num_chunks=wide_decode_chunks,
+@@ -68,11 +74,13 @@ def compressed_mla_split_chunks_for_contract(
+     rows: int,
+     width: int,
+     max_chunks: int | None = None,
++    decode_row_capacity: int | None = None,
+ ) -> int:
+     return compressed_mla_split_config_for_contract(
+         rows=rows,
+         width=width,
+         max_chunks=max_chunks,
++        decode_row_capacity=decode_row_capacity,
+     ).num_chunks
+ 
+ 
+diff --git a/b12x/attention/compressed_mla/_scratch.py b/b12x/attention/compressed_mla/_scratch.py
+index b462b0ec0ddb7c456a6cec54cc00dc585a8e771f..ec9244ebc6fa4f94c8778f79117cf33f1db4e0c5 100644
+--- a/b12x/attention/compressed_mla/_scratch.py
++++ b/b12x/attention/compressed_mla/_scratch.py
+@@ -46,6 +46,7 @@ class B12XCompressedMLAScratchCaps:
+     max_kv_rows: int = 0
+     max_chunks_per_row: int = 64
+     max_q_chunks: int | None = None
++    decode_row_capacity: int | None = None
+     page_size: int = 64
+ 
+     def __post_init__(self) -> None:
+@@ -74,6 +75,13 @@ class B12XCompressedMLAScratchCaps:
+         )
+         if self.max_q_chunks is not None:
+             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
++        if self.decode_row_capacity is not None:
++            decode_row_capacity = int(self.decode_row_capacity)
++            if decode_row_capacity <= 0:
++                raise ValueError(
++                    f"decode_row_capacity must be positive, got {decode_row_capacity}"
++                )
++            object.__setattr__(self, "decode_row_capacity", decode_row_capacity)
+         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+ 
+ 
+@@ -376,6 +384,7 @@ def _materialize_compressed_mla_scratch(
+         rows=caps.max_q_rows,
+         width=caps.max_width,
+         max_chunks=caps.max_chunks_per_row,
++        decode_row_capacity=caps.decode_row_capacity,
+     )
+     scratch.set_split_chunk_config(
+         kv_chunk_size=split_cfg.chunk_size,
+diff --git a/b12x/comm/pcie/_cute_intrinsics.py b/b12x/comm/pcie/_cute_intrinsics.py
+index 36d10cd2130930e18898d4109b795daf2e547df2..6f2daab78ea857079cdbc74cec904b54aa0688a2 100644
+--- a/b12x/comm/pcie/_cute_intrinsics.py
++++ b/b12x/comm/pcie/_cute_intrinsics.py
+@@ -17,6 +17,25 @@ from cutlass._mlir.dialects import llvm
+ from cutlass.cutlass_dsl import T, dsl_user_op
+ 
+ 
++@dsl_user_op
++def f32_as_u32(value: Float32, *, loc=None, ip=None) -> Uint32:
++    """Bitcast float32 to uint32 without numeric conversion."""
++
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [Float32(value).ir_value(loc=loc, ip=ip)],
++            "mov.b32 $0, $1;",
++            "=r,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
+ @dsl_user_op
+ def ld_global_u64(addr: Int64, *, loc=None, ip=None) -> Uint64:
+     return Uint64(
+@@ -195,9 +214,7 @@ def unpack_bf16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32
+ 
+ 
+ @dsl_user_op
+-def pack_f32x2_to_f16x2(
+-    lo: Float32, hi: Float32, *, loc=None, ip=None
+-) -> Uint32:
++def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
+     return Uint32(
+         llvm.inline_asm(
+             T.i32(),
+@@ -217,9 +234,7 @@ def pack_f32x2_to_f16x2(
+ 
+ 
+ @dsl_user_op
+-def pack_f32x2_to_bf16x2(
+-    lo: Float32, hi: Float32, *, loc=None, ip=None
+-) -> Uint32:
++def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
+     """Match two scalar ``__float2bfloat16`` conversions without saturation."""
+     return Uint32(
+         llvm.inline_asm(
+@@ -313,9 +328,7 @@ def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
+ 
+ 
+ @dsl_user_op
+-def atomic_add_global_u32(
+-    addr: Int64, value: Uint32, *, loc=None, ip=None
+-) -> Uint32:
++def atomic_add_global_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
+     return Uint32(
+         llvm.inline_asm(
+             T.i32(),
+diff --git a/b12x/comm/pcie/_oneshot_cute.py b/b12x/comm/pcie/_oneshot_cute.py
+index 7a846996dfa12c1f8e0650dc340bb1aca3f19cb5..d0b5ca091d1ef824df4ccf207fa6b68b144853c4 100644
+--- a/b12x/comm/pcie/_oneshot_cute.py
++++ b/b12x/comm/pcie/_oneshot_cute.py
+@@ -30,6 +30,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
+ 
+ from ._cute_intrinsics import (
+     atomic_add_global_u32,
++    f32_as_u32,
+     graph_epoch_arrive,
+     ld_global_f32,
+     ld_relaxed_gpu_u32,
+@@ -108,9 +109,7 @@ class _PackedMath:
+                     accumulator[lane + 1] = accumulator[lane + 1] + hi
+ 
+     @cute.jit
+-    def _store_accumulator(
+-        self, address: Int64, accumulator: cute.Tensor
+-    ) -> None:
++    def _store_accumulator(self, address: Int64, accumulator: cute.Tensor) -> None:
+         if cutlass.const_expr(self._dtype_name == "float32"):
+             st_global_v4_f32(
+                 address,
+@@ -131,16 +130,12 @@ class _PackedMath:
+                     packed[word] = pack_f32x2_to_bf16x2(
+                         accumulator[lane], accumulator[lane + 1]
+                     )
+-            st_global_v4_u32(
+-                address, packed[0], packed[1], packed[2], packed[3]
+-            )
++            st_global_v4_u32(address, packed[0], packed[1], packed[2], packed[3])
+ 
+     @cute.jit
+     def _copy_pack(self, source: Int64, destination: Int64) -> None:
+         words = ld_global_v4_u32(source)
+-        st_global_v4_u32(
+-            destination, words[0], words[1], words[2], words[3]
+-        )
++        st_global_v4_u32(destination, words[0], words[1], words[2], words[3])
+ 
+     @cute.jit
+     def _warp_reduce_down(self, value: Float32) -> Float32:
+@@ -204,14 +199,24 @@ class _OneshotLaunch(_PackedMath):
+             self_counter = self_signal + (
+                 Int64(bidx) * Int64(_MAX_RANKS) + Int64(tidx)
+             ) * Int64(4)
+-            peer_slot0 = peer_signal + Int64(_SELF_COUNTER_BYTES) + (
+-                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+-                + Int64(self._rank * _FLAG_STRIDE)
+-            ) * Int64(4)
+-            wait_slot0 = self_signal + Int64(_SELF_COUNTER_BYTES) + (
+-                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+-                + Int64(tidx) * Int64(_FLAG_STRIDE)
+-            ) * Int64(4)
++            peer_slot0 = (
++                peer_signal
++                + Int64(_SELF_COUNTER_BYTES)
++                + (
++                    Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
++                    + Int64(self._rank * _FLAG_STRIDE)
++                )
++                * Int64(4)
++            )
++            wait_slot0 = (
++                self_signal
++                + Int64(_SELF_COUNTER_BYTES)
++                + (
++                    Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
++                    + Int64(tidx) * Int64(_FLAG_STRIDE)
++                )
++                * Int64(4)
++            )
+             pcie_arrive_and_wait(
+                 self_counter,
+                 peer_slot0,
+@@ -258,9 +263,7 @@ class _OneshotLaunch(_PackedMath):
+         self._multi_gpu_barrier(signal_ptrs)
+ 
+         while index < size_packs:
+-            accumulator = cute.make_rmem_tensor(
+-                (self._pack_elems,), cutlass.Float32
+-            )
++            accumulator = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+             for peer_index in cutlass.range_constexpr(self._world_size):
+                 peer_rank = (self._rank + peer_index) % self._world_size
+                 peer_base = Int64(peer_ptrs[peer_rank])
+@@ -269,9 +272,7 @@ class _OneshotLaunch(_PackedMath):
+                     peer_base + Int64(index) * Int64(16),
+                     peer_index == 0,
+                 )
+-            self._store_accumulator(
+-                output_base + Int64(index) * Int64(16), accumulator
+-            )
++            self._store_accumulator(output_base + Int64(index) * Int64(16), accumulator)
+             index += stride
+ 
+         if cutlass.const_expr(self._device_slot_selection):
+@@ -298,8 +299,23 @@ class _FusedOneshotLaunch(_PackedMath):
+         threads: int,
+     ) -> None:
+         super().__init__(dtype_name)
+-        if mode not in ("registered", "stage_pull", "stage_push"):
++        if mode not in (
++            "registered",
++            "stage_pull",
++            "stage_push",
++            "stage_remote_push",
++            "stage_tp8_owner",
++        ):
+             raise ValueError(f"invalid fused oneshot mode {mode!r}")
++        if mode == "stage_remote_push" and world_size not in (2, 4):
++            raise ValueError("fused remote push requires TP2 or TP4")
++        if mode == "stage_tp8_owner" and world_size != 8:
++            raise ValueError("fused owner transport requires TP8")
++        if mode == "stage_tp8_owner" and dtype_name not in (
++            "float16",
++            "bfloat16",
++        ):
++            raise ValueError("fused TP8 owner transport requires float16 or bfloat16")
+         self._world_size = int(world_size)
+         self._rank = int(rank)
+         self._mode = mode
+@@ -308,6 +324,10 @@ class _FusedOneshotLaunch(_PackedMath):
+         self._device_slot_selection = bool(device_slot_selection)
+         self._slot_bias = int(slot_bias) & 1
+         self._threads = int(threads)
++        # C1 uses the ordinary staged protocol while C2-C8 use three scoped
++        # phases. Keep their reusable barrier generations in separate rank
++        # slots when one graph-owned channel alternates between those shapes.
++        self._barrier_rank_offset = 8 if mode == "stage_tp8_owner" else 0
+ 
+     @cute.jit
+     def __call__(
+@@ -347,32 +367,80 @@ class _FusedOneshotLaunch(_PackedMath):
+             stream=stream,
+         )
+ 
++    @cute.jit
++    def _pair_arrive_and_wait(
++        self,
++        signal_ptrs: cute.Pointer,
++        peer_rank: Int32,
++    ) -> None:
++        bidx, _, _ = cute.arch.block_idx()
++        barrier_peer = peer_rank + Int32(self._barrier_rank_offset)
++        self_signal = Int64(signal_ptrs[self._rank])
++        peer_signal = Int64(signal_ptrs[peer_rank])
++        self_counter = self_signal + (
++            Int64(bidx) * Int64(_MAX_RANKS) + Int64(barrier_peer)
++        ) * Int64(4)
++        peer_slot0 = (
++            peer_signal
++            + Int64(_SELF_COUNTER_BYTES)
++            + (
++                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
++                + Int64((self._rank + self._barrier_rank_offset) * _FLAG_STRIDE)
++            )
++            * Int64(4)
++        )
++        wait_slot0 = (
++            self_signal
++            + Int64(_SELF_COUNTER_BYTES)
++            + (
++                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
++                + Int64(barrier_peer) * Int64(_FLAG_STRIDE)
++            )
++            * Int64(4)
++        )
++        pcie_arrive_and_wait(
++            self_counter,
++            peer_slot0,
++            wait_slot0,
++            Int64(_PEER_SLOT_BYTES),
++        )
++
+     @cute.jit
+     def _multi_gpu_barrier(self, signal_ptrs: cute.Pointer) -> None:
+         tidx, _, _ = cute.arch.thread_idx()
+-        bidx, _, _ = cute.arch.block_idx()
+         if cutlass.const_expr(self._mode != "registered"):
+             cute.arch.sync_threads()
+         if tidx < Int32(self._world_size):
+-            self_signal = Int64(signal_ptrs[self._rank])
+-            peer_signal = Int64(signal_ptrs[tidx])
+-            self_counter = self_signal + (
+-                Int64(bidx) * Int64(_MAX_RANKS) + Int64(tidx)
+-            ) * Int64(4)
+-            peer_slot0 = peer_signal + Int64(_SELF_COUNTER_BYTES) + (
+-                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+-                + Int64(self._rank * _FLAG_STRIDE)
+-            ) * Int64(4)
+-            wait_slot0 = self_signal + Int64(_SELF_COUNTER_BYTES) + (
+-                Int64(bidx) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+-                + Int64(tidx) * Int64(_FLAG_STRIDE)
+-            ) * Int64(4)
+-            pcie_arrive_and_wait(
+-                self_counter,
+-                peer_slot0,
+-                wait_slot0,
+-                Int64(_PEER_SLOT_BYTES),
+-            )
++            self._pair_arrive_and_wait(signal_ptrs, Int32(tidx))
++        cute.arch.sync_threads()
++
++    @cute.jit
++    def _tp8_island_barrier(self, signal_ptrs: cute.Pointer) -> None:
++        """Publish and acquire payloads within one four-rank island."""
++
++        tidx, _, _ = cute.arch.thread_idx()
++        island_base = Int32(0 if self._rank < 4 else 4)
++        cute.arch.sync_threads()
++        if tidx < Int32(4):
++            peer_rank = island_base + Int32(tidx)
++            if peer_rank != Int32(self._rank):
++                self._pair_arrive_and_wait(signal_ptrs, peer_rank)
++        cute.arch.sync_threads()
++
++    @cute.jit
++    def _tp8_owner_pair_barrier(self, signal_ptrs: cute.Pointer) -> None:
++        """Publish and acquire one FP32 partial between paired owners.
++
++        This barrier must remain mutual so paired owners can skew by at most
++        one invocation. Eager slots alternate between invocations, making
++        that bounded skew use different storage. Both properties are safety
++        requirements for local-partial publication and final consumption.
++        """
++
++        tidx, _, _ = cute.arch.thread_idx()
++        cute.arch.sync_threads()
++        if Int32(tidx) == Int32(0):
++            self._pair_arrive_and_wait(signal_ptrs, Int32(self._rank ^ 4))
+         cute.arch.sync_threads()
+ 
+     @cute.jit
+@@ -381,6 +449,7 @@ class _FusedOneshotLaunch(_PackedMath):
+         peer_ptrs: cute.Pointer,
+         input_base: Int64,
+         index: Int64,
++        total_packs: Int64,
+         shard_packs: Int64,
+     ) -> None:
+         if cutlass.const_expr(self._mode == "stage_pull"):
+@@ -388,7 +457,9 @@ class _FusedOneshotLaunch(_PackedMath):
+                 input_base + index * Int64(16),
+                 Int64(peer_ptrs[self._rank]) + index * Int64(16),
+             )
+-        elif cutlass.const_expr(self._mode == "stage_push"):
++        elif cutlass.const_expr(
++            self._mode == "stage_push" or self._mode == "stage_remote_push"
++        ):
+             source = input_base + index * Int64(16)
+             words = ld_global_v4_u32(source)
+             for peer_index in cutlass.range_constexpr(1, self._world_size):
+@@ -396,8 +467,135 @@ class _FusedOneshotLaunch(_PackedMath):
+                 destination = Int64(peer_ptrs[destination_rank]) + (
+                     Int64(self._rank) * shard_packs + index
+                 ) * Int64(16)
++                st_global_v4_u32(destination, words[0], words[1], words[2], words[3])
++        elif cutlass.const_expr(self._mode == "stage_tp8_owner"):
++            part = total_packs // Int64(4)
++            chunk = index // part
++            if chunk > Int64(3):
++                chunk = Int64(3)
++            island_base = Int64(0 if self._rank < 4 else 4)
++            owner_rank = island_base + chunk
++            destination = Int64(peer_ptrs[owner_rank]) + (
++                Int64(self._rank) * shard_packs + index
++            ) * Int64(16)
++            words = ld_global_v4_u32(input_base + index * Int64(16))
++            st_global_v4_u32(destination, words[0], words[1], words[2], words[3])
++
++    @cute.jit
++    def _tp8_publish_local_partial(
++        self,
++        peer_ptrs: cute.Pointer,
++        index: Int64,
++        total_packs: Int64,
++        shard_packs: Int64,
++    ) -> None:
++        part = total_packs // Int64(4)
++        chunk = index // part
++        if chunk > Int64(3):
++            chunk = Int64(3)
++        island_base = 0 if self._rank < 4 else 4
++        owner_rank = Int32(island_base) + Int32(chunk)
++        if Int32(self._rank) == owner_rank:
++            local_stage = Int64(peer_ptrs[self._rank])
++            local_sum = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
++            for peer_local in cutlass.range_constexpr(4):
++                source_rank = island_base + peer_local
++                self._load_accumulate(
++                    local_sum,
++                    local_stage
++                    + (Int64(source_rank) * shard_packs + index) * Int64(16),
++                    peer_local == 0,
++                )
++
++            low = (
++                f32_as_u32(local_sum[0]),
++                f32_as_u32(local_sum[1]),
++                f32_as_u32(local_sum[2]),
++                f32_as_u32(local_sum[3]),
++            )
++            high = (
++                f32_as_u32(local_sum[4]),
++                f32_as_u32(local_sum[5]),
++                f32_as_u32(local_sum[6]),
++                f32_as_u32(local_sum[7]),
++            )
++            cross_owner = self._rank ^ 4
++            for destination_rank in (self._rank, cross_owner):
++                destination_stage = Int64(peer_ptrs[destination_rank])
++                st_global_v4_u32(
++                    destination_stage
++                    + (Int64(self._rank) * shard_packs + index) * Int64(16),
++                    low[0],
++                    low[1],
++                    low[2],
++                    low[3],
++                )
+                 st_global_v4_u32(
+-                    destination, words[0], words[1], words[2], words[3]
++                    destination_stage
++                    + (Int64(self._rank ^ 1) * shard_packs + index) * Int64(16),
++                    high[0],
++                    high[1],
++                    high[2],
++                    high[3],
++                )
++
++    @cute.jit
++    def _tp8_publish_final(
++        self,
++        peer_ptrs: cute.Pointer,
++        index: Int64,
++        total_packs: Int64,
++        shard_packs: Int64,
++    ) -> None:
++        part = total_packs // Int64(4)
++        chunk = index // part
++        if chunk > Int64(3):
++            chunk = Int64(3)
++        island_base = 0 if self._rank < 4 else 4
++        owner_rank = Int32(island_base) + Int32(chunk)
++        if Int32(self._rank) == owner_rank:
++            local_stage = Int64(peer_ptrs[self._rank])
++            cross_owner = self._rank ^ 4
++            local_low = ld_global_v4_u32(
++                local_stage + (Int64(self._rank) * shard_packs + index) * Int64(16)
++            )
++            local_high = ld_global_v4_u32(
++                local_stage + (Int64(self._rank ^ 1) * shard_packs + index) * Int64(16)
++            )
++            cross_low = ld_global_v4_u32(
++                local_stage + (Int64(cross_owner) * shard_packs + index) * Int64(16)
++            )
++            cross_high = ld_global_v4_u32(
++                local_stage + (Int64(cross_owner ^ 1) * shard_packs + index) * Int64(16)
++            )
++            final_low = cute.make_rmem_tensor((4,), cutlass.Uint32)
++            final_high = cute.make_rmem_tensor((4,), cutlass.Uint32)
++            for lane in cutlass.range_constexpr(4):
++                final_low[lane] = f32_as_u32(
++                    u32_as_f32(local_low[lane]) + u32_as_f32(cross_low[lane])
++                )
++                final_high[lane] = f32_as_u32(
++                    u32_as_f32(local_high[lane]) + u32_as_f32(cross_high[lane])
++                )
++
++            for peer_local in cutlass.range_constexpr(4):
++                destination_rank = island_base + peer_local
++                destination_stage = Int64(peer_ptrs[destination_rank])
++                st_global_v4_u32(
++                    destination_stage
++                    + (Int64(self._rank) * shard_packs + index) * Int64(16),
++                    final_low[0],
++                    final_low[1],
++                    final_low[2],
++                    final_low[3],
++                )
++                st_global_v4_u32(
++                    destination_stage
++                    + (Int64(self._rank ^ 1) * shard_packs + index) * Int64(16),
++                    final_high[0],
++                    final_high[1],
++                    final_high[2],
++                    final_high[3],
+                 )
+ 
+     @cute.jit
+@@ -407,10 +605,44 @@ class _FusedOneshotLaunch(_PackedMath):
+         input_base: Int64,
+         residual_base: Int64,
+         index: Int64,
++        total_packs: Int64,
+         shard_packs: Int64,
+         accumulator: cute.Tensor,
+     ) -> None:
+-        if cutlass.const_expr(self._mode == "stage_push"):
++        if cutlass.const_expr(self._mode == "stage_tp8_owner"):
++            part = total_packs // Int64(4)
++            chunk = index // part
++            if chunk > Int64(3):
++                chunk = Int64(3)
++            island_base = Int64(0 if self._rank < 4 else 4)
++            owner_rank = island_base + chunk
++            local_stage = Int64(peer_ptrs[self._rank])
++            low = ld_global_v4_u32(
++                local_stage + (owner_rank * shard_packs + index) * Int64(16)
++            )
++            high = ld_global_v4_u32(
++                local_stage
++                + ((owner_rank ^ Int64(1)) * shard_packs + index) * Int64(16)
++            )
++            for lane in cutlass.range_constexpr(4):
++                accumulator[lane] = u32_as_f32(low[lane])
++                accumulator[lane + 4] = u32_as_f32(high[lane])
++        elif cutlass.const_expr(self._mode == "stage_remote_push"):
++            self._load_accumulate(
++                accumulator,
++                input_base + index * Int64(16),
++                True,
++            )
++            local_stage = Int64(peer_ptrs[self._rank])
++            for peer_index in cutlass.range_constexpr(1, self._world_size):
++                source_rank = (self._rank + peer_index) % self._world_size
++                self._load_accumulate(
++                    accumulator,
++                    local_stage
++                    + (Int64(source_rank) * shard_packs + index) * Int64(16),
++                    False,
++                )
++        elif cutlass.const_expr(self._mode == "stage_push"):
+             self._load_accumulate(
+                 accumulator,
+                 input_base + index * Int64(16),
+@@ -423,10 +655,7 @@ class _FusedOneshotLaunch(_PackedMath):
+                     self._load_accumulate(
+                         accumulator,
+                         local_stage
+-                        + (
+-                            Int64(source_rank) * shard_packs + index
+-                        )
+-                        * Int64(16),
++                        + (Int64(source_rank) * shard_packs + index) * Int64(16),
+                         not initialized,
+                     )
+                     initialized = True
+@@ -480,7 +709,6 @@ class _FusedOneshotLaunch(_PackedMath):
+         shard_packs: Int64,
+         epsilon: Float32,
+     ) -> None:
+-        del rows
+         tidx, _, _ = cute.arch.thread_idx()
+         bidx, _, _ = cute.arch.block_idx()
+         gdim, _, _ = cute.arch.grid_dim()
+@@ -494,6 +722,7 @@ class _FusedOneshotLaunch(_PackedMath):
+             col_stride = ctas_per_row * Int32(self._threads)
+         col0 = row_cta * Int32(self._threads) + Int32(tidx)
+         row_offset = Int64(row) * Int64(hidden_packs)
++        total_packs = Int64(rows) * Int64(hidden_packs)
+ 
+         input_base = Int64(input_ptr.toint())
+         residual_base = Int64(residual_ptr.toint())
+@@ -502,9 +731,7 @@ class _FusedOneshotLaunch(_PackedMath):
+         residual_output_base = Int64(residual_output_ptr.toint())
+         self_signal = Int64(signal_ptrs[self._rank])
+         if cutlass.const_expr(self._device_slot_selection):
+-            generation = ld_relaxed_gpu_u32(
+-                self_signal + Int64(_GRAPH_EPOCH_OFFSET)
+-            )
++            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+             slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
+             peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+ 
+@@ -535,6 +762,7 @@ class _FusedOneshotLaunch(_PackedMath):
+                         peer_ptrs,
+                         input_base,
+                         row_offset + Int64(col),
++                        total_packs,
+                         shard_packs,
+                     )
+         elif cutlass.const_expr(self._mode != "registered"):
+@@ -544,16 +772,39 @@ class _FusedOneshotLaunch(_PackedMath):
+                     peer_ptrs,
+                     input_base,
+                     row_offset + Int64(col),
++                    total_packs,
+                     shard_packs,
+                 )
+                 col += col_stride
+ 
+-        self._multi_gpu_barrier(signal_ptrs)
++        if cutlass.const_expr(self._mode == "stage_tp8_owner"):
++            self._tp8_island_barrier(signal_ptrs)
++            col = col0
++            while col < hidden_packs:
++                self._tp8_publish_local_partial(
++                    peer_ptrs,
++                    row_offset + Int64(col),
++                    total_packs,
++                    shard_packs,
++                )
++                col += col_stride
++            self._tp8_owner_pair_barrier(signal_ptrs)
++
++            col = col0
++            while col < hidden_packs:
++                self._tp8_publish_final(
++                    peer_ptrs,
++                    row_offset + Int64(col),
++                    total_packs,
++                    shard_packs,
++                )
++                col += col_stride
++            self._tp8_island_barrier(signal_ptrs)
++        else:
++            self._multi_gpu_barrier(signal_ptrs)
+ 
+         square_sum = Float32(0.0)
+-        values = cute.make_rmem_tensor(
+-            (_REG_PACKS, self._pack_elems), cutlass.Float32
+-        )
++        values = cute.make_rmem_tensor((_REG_PACKS, self._pack_elems), cutlass.Float32)
+         if cutlass.const_expr(self._register_normalize):
+             for pack_number in cutlass.range_constexpr(_REG_PACKS):
+                 col = col0 + Int32(pack_number) * col_stride
+@@ -567,6 +818,7 @@ class _FusedOneshotLaunch(_PackedMath):
+                         input_base,
+                         residual_base,
+                         index,
++                        total_packs,
+                         shard_packs,
+                         accumulator,
+                     )
+@@ -589,6 +841,7 @@ class _FusedOneshotLaunch(_PackedMath):
+                     input_base,
+                     residual_base,
+                     index,
++                    total_packs,
+                     shard_packs,
+                     accumulator,
+                 )
+@@ -604,38 +857,28 @@ class _FusedOneshotLaunch(_PackedMath):
+         hidden_size_f = Float32(hidden_packs * Int32(self._pack_elems))
+         if cutlass.const_expr(self._single_cta):
+             if Int32(tidx) == Int32(0):
+-                inv_rms_smem[0] = rsqrt_approx_f32(
+-                    square_sum / hidden_size_f + epsilon
+-                )
++                inv_rms_smem[0] = rsqrt_approx_f32(square_sum / hidden_size_f + epsilon)
+         else:
+             if Int32(tidx) == Int32(0):
+                 st_global_f32(
+-                    self_signal
+-                    + Int64(_RMS_PARTIAL_OFFSET)
+-                    + Int64(bidx) * Int64(4),
++                    self_signal + Int64(_RMS_PARTIAL_OFFSET) + Int64(bidx) * Int64(4),
+                     square_sum,
+                 )
+                 threadfence_gpu()
+                 arrive_address = (
+-                    self_signal
+-                    + Int64(_RMS_ARRIVE_OFFSET)
+-                    + Int64(row) * Int64(4)
++                    self_signal + Int64(_RMS_ARRIVE_OFFSET) + Int64(row) * Int64(4)
+                 )
+                 prior = atomic_add_global_u32(arrive_address, Uint32(1))
+                 if prior == Uint32(ctas_per_row - Int32(1)):
+                     st_global_u32(arrive_address, Uint32(0))
+                     threadfence_gpu()
+                     atomic_add_global_u32(
+-                        self_signal
+-                        + Int64(_RMS_GEN_OFFSET)
+-                        + Int64(row) * Int64(4),
++                        self_signal + Int64(_RMS_GEN_OFFSET) + Int64(row) * Int64(4),
+                         Uint32(1),
+                     )
+                 else:
+                     spin_until_changed_acquire_gpu(
+-                        self_signal
+-                        + Int64(_RMS_GEN_OFFSET)
+-                        + Int64(row) * Int64(4),
++                        self_signal + Int64(_RMS_GEN_OFFSET) + Int64(row) * Int64(4),
+                         row_generation,
+                     )
+             cute.arch.sync_threads()
+@@ -646,10 +889,7 @@ class _FusedOneshotLaunch(_PackedMath):
+                     partial = partial + ld_global_f32(
+                         self_signal
+                         + Int64(_RMS_PARTIAL_OFFSET)
+-                        + (
+-                            Int64(row) * Int64(ctas_per_row)
+-                            + Int64(partial_index)
+-                        )
++                        + (Int64(row) * Int64(ctas_per_row) + Int64(partial_index))
+                         * Int64(4)
+                     )
+                     partial_index += Int32(32)
+@@ -665,9 +905,7 @@ class _FusedOneshotLaunch(_PackedMath):
+             for pack_number in cutlass.range_constexpr(_REG_PACKS):
+                 col = col0 + Int32(pack_number) * col_stride
+                 if col < hidden_packs:
+-                    scale = cute.make_rmem_tensor(
+-                        (self._pack_elems,), cutlass.Float32
+-                    )
++                    scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                     self._load_accumulate(
+                         scale, weight_base + Int64(col) * Int64(16), True
+                     )
+@@ -675,38 +913,28 @@ class _FusedOneshotLaunch(_PackedMath):
+                         (self._pack_elems,), cutlass.Float32
+                     )
+                     for lane in cutlass.range_constexpr(self._pack_elems):
+-                        normalized[lane] = (
+-                            values[pack_number, lane]
+-                            * (inv_rms * scale[lane])
++                        normalized[lane] = values[pack_number, lane] * (
++                            inv_rms * scale[lane]
+                         )
+                     self._store_accumulator(
+-                        output_base
+-                        + (row_offset + Int64(col)) * Int64(16),
++                        output_base + (row_offset + Int64(col)) * Int64(16),
+                         normalized,
+                     )
+         else:
+             col = col0
+             while col < hidden_packs:
+                 index = row_offset + Int64(col)
+-                value = cute.make_rmem_tensor(
+-                    (self._pack_elems,), cutlass.Float32
+-                )
+-                scale = cute.make_rmem_tensor(
+-                    (self._pack_elems,), cutlass.Float32
+-                )
++                value = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
++                scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                 self._load_accumulate(
+                     value,
+                     residual_output_base + index * Int64(16),
+                     True,
+                 )
+-                self._load_accumulate(
+-                    scale, weight_base + Int64(col) * Int64(16), True
+-                )
++                self._load_accumulate(scale, weight_base + Int64(col) * Int64(16), True)
+                 for lane in cutlass.range_constexpr(self._pack_elems):
+                     value[lane] = value[lane] * (inv_rms * scale[lane])
+-                self._store_accumulator(
+-                    output_base + index * Int64(16), value
+-                )
++                self._store_accumulator(output_base + index * Int64(16), value)
+                 col += col_stride
+ 
+         if cutlass.const_expr(self._device_slot_selection):
+@@ -719,9 +947,7 @@ class _FusedOneshotLaunch(_PackedMath):
+ 
+ 
+ def _dummy(dtype, alignment: int):
+-    return make_ptr(
+-        dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment
+-    )
++    return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment)
+ 
+ 
+ def _oneshot_process_key(
+@@ -758,16 +984,19 @@ def is_oneshot_launcher_prepared(
+ ) -> bool:
+     """Return whether this exact process-local launcher is already loaded."""
+ 
+-    return _oneshot_process_key(
+-        dtype_name,
+-        world_size,
+-        rank,
+-        stage_input,
+-        device_slot_selection,
+-        slot_bias,
+-        threads,
+-        device_index,
+-    ) in _PREPARED_ONESHOT_LAUNCHERS
++    return (
++        _oneshot_process_key(
++            dtype_name,
++            world_size,
++            rank,
++            stage_input,
++            device_slot_selection,
++            slot_bias,
++            threads,
++            device_index,
++        )
++        in _PREPARED_ONESHOT_LAUNCHERS
++    )
+ 
+ 
+ @functools.cache
+@@ -823,9 +1052,7 @@ def get_oneshot_launcher(
+         1,
+         1,
+         current_cuda_stream(),
+-        compile_spec=KernelCompileSpec.from_key(
+-            "comm.pcie.oneshot", 1, cache_key
+-        ),
++        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 1, cache_key),
+     )
+ 
+     def run(
+@@ -910,18 +1137,21 @@ def is_fused_oneshot_launcher_prepared(
+ ) -> bool:
+     """Return whether this exact fused graph launcher is already loaded."""
+ 
+-    return _fused_oneshot_process_key(
+-        dtype_name,
+-        world_size,
+-        rank,
+-        mode,
+-        single_cta,
+-        register_normalize,
+-        device_slot_selection,
+-        slot_bias,
+-        threads,
+-        device_index,
+-    ) in _PREPARED_FUSED_ONESHOT_LAUNCHERS
++    return (
++        _fused_oneshot_process_key(
++            dtype_name,
++            world_size,
++            rank,
++            mode,
++            single_cta,
++            register_normalize,
++            device_slot_selection,
++            slot_bias,
++            threads,
++            device_index,
++        )
++        in _PREPARED_FUSED_ONESHOT_LAUNCHERS
++    )
+ 
+ 
+ @functools.cache
+@@ -1013,13 +1243,39 @@ def get_fused_oneshot_launcher(
+         grid_x: int,
+     ) -> None:
+         raw(
+-            make_ptr(cutlass.Uint64, peer_table_address, cute.AddressSpace.gmem, assumed_align=8),
+-            make_ptr(cutlass.Uint64, signal_table_address, cute.AddressSpace.gmem, assumed_align=8),
+-            make_ptr(cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
+-            make_ptr(cutlass.Uint32, residual_address, cute.AddressSpace.gmem, assumed_align=16),
+-            make_ptr(cutlass.Uint32, weight_address, cute.AddressSpace.gmem, assumed_align=16),
+-            make_ptr(cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
+-            make_ptr(cutlass.Uint32, residual_output_address, cute.AddressSpace.gmem, assumed_align=16),
++            make_ptr(
++                cutlass.Uint64,
++                peer_table_address,
++                cute.AddressSpace.gmem,
++                assumed_align=8,
++            ),
++            make_ptr(
++                cutlass.Uint64,
++                signal_table_address,
++                cute.AddressSpace.gmem,
++                assumed_align=8,
++            ),
++            make_ptr(
++                cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16
++            ),
++            make_ptr(
++                cutlass.Uint32,
++                residual_address,
++                cute.AddressSpace.gmem,
++                assumed_align=16,
++            ),
++            make_ptr(
++                cutlass.Uint32, weight_address, cute.AddressSpace.gmem, assumed_align=16
++            ),
++            make_ptr(
++                cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16
++            ),
++            make_ptr(
++                cutlass.Uint32,
++                residual_output_address,
++                cute.AddressSpace.gmem,
++                assumed_align=16,
++            ),
+             int(hidden_packs),
+             int(rows),
+             int(ctas_per_row),
+diff --git a/b12x/comm/pcie/pcie_oneshot.py b/b12x/comm/pcie/pcie_oneshot.py
+index 614266b4b705566dd29340a87bd0aa5ea5415b8e..6dcc3c8df2e8ba22617f6e8fd5f67ca990126172 100644
+--- a/b12x/comm/pcie/pcie_oneshot.py
++++ b/b12x/comm/pcie/pcie_oneshot.py
+@@ -114,6 +114,51 @@ def _push_mode_enabled() -> bool:
+     return os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0")
+ 
+ 
++def _tp2_remote_push_enabled() -> bool:
++    """Enable the qualified fused TP2 remote-write transport."""
++
++    return os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
++
++
++def _tp4_remote_push_enabled() -> bool:
++    """Enable the qualified fused TP4 remote-write transport."""
++
++    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
++
++
++def _tp8_owner_reduce_enabled() -> bool:
++    """Enable the qualified topology-scoped fused TP8 transport by default."""
++
++    return os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
++
++
++def _uses_sharded_eager_storage(
++    world_size: int,
++    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
++) -> bool:
++    """Return whether staged fused transport needs one shard per source."""
++
++    push, tp2_remote, tp4_remote, tp8_owner = (
++        _transport_policy_contract() if transport_policy is None else transport_policy
++    )
++    return push or (
++        (world_size == 2 and tp2_remote)
++        or (world_size == 4 and tp4_remote)
++        or (world_size == 8 and tp8_owner)
++    )
++
++
++def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
++    """Values that must agree across ranks before IPC storage is allocated."""
++
++    return (
++        _push_mode_enabled(),
++        _tp2_remote_push_enabled(),
++        _tp4_remote_push_enabled(),
++        _tp8_owner_reduce_enabled(),
++    )
++
++
+ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
+     if inp.is_contiguous():
+         return True
+@@ -569,9 +614,7 @@ def _require_full_grid_residency(
+         visible_sms = int(
+             torch.cuda.get_device_properties(device).multi_processor_count
+         )
+-        test_visible_sms = int(
+-            os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0"
+-        )
++        test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+         if test_visible_sms > 0:
+             visible_sms = min(visible_sms, test_visible_sms)
+         if visible_sms < required_sms:
+@@ -1206,6 +1249,9 @@ class _CuTeOneshotState:
+     registered_tables: dict[int, int]
+     eager_tables: Optional[tuple[int, int]] = None
+     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
++    eager_buffer_bytes: Optional[int] = None
++    transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
++    sharded_eager_storage: bool = False
+     eager_slot: int = 0
+     device_slot_selection: bool = False
+     slot_bias: int = 0
+@@ -1236,6 +1282,8 @@ class _CuTeOneshotBackend:
+         self._next_handle = 1
+         self._states: dict[int, _CuTeOneshotState] = {}
+ 
++    supports_eager_storage_contract = True
++
+     @staticmethod
+     def meta_size() -> int:
+         return _SIGNAL_BYTES
+@@ -1315,6 +1363,8 @@ class _CuTeOneshotBackend:
+         handle: int,
+         pointers0: Sequence[int],
+         pointers1: Sequence[int],
++        eager_buffer_bytes: Optional[int] = None,
++        transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+     ) -> None:
+         state = self._state(handle)
+         ptrs0 = tuple(int(pointer) for pointer in pointers0)
+@@ -1323,6 +1373,18 @@ class _CuTeOneshotBackend:
+         table1 = self._write_table(state, ptrs1)
+         state.eager_tables = (table0, table1)
+         state.eager_ptrs = (ptrs0, ptrs1)
++        state.eager_buffer_bytes = (
++            None if eager_buffer_bytes is None else int(eager_buffer_bytes)
++        )
++        state.transport_policy = (
++            _transport_policy_contract()
++            if transport_policy is None
++            else tuple(bool(value) for value in transport_policy)
++        )
++        state.sharded_eager_storage = _uses_sharded_eager_storage(
++            state.world_size,
++            state.transport_policy,
++        )
+         state.registered_tables[ptrs0[state.rank]] = table0
+         state.registered_tables[ptrs1[state.rank]] = table1
+         state.eager_slot = 0
+@@ -1331,9 +1393,7 @@ class _CuTeOneshotBackend:
+     def _launch_geometry(size_packs: int) -> tuple[int, int]:
+         threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
+         threads = min(512, max(64, (threads // 32) * 32))
+-        block_limit = int(
+-            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8")
+-        )
++        block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
+         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+             raise ValueError(
+                 f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
+@@ -1346,6 +1406,43 @@ class _CuTeOneshotBackend:
+         threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
+         return min(512, max(64, (threads // 32) * 32))
+ 
++    @staticmethod
++    def _fused_topology_mode(
++        state: _CuTeOneshotState,
++        inp: torch.Tensor,
++    ) -> Optional[str]:
++        """Select only topology transports with a qualified shape contract."""
++
++        if (
++            state.eager_tables is None
++            or state.eager_buffer_bytes is None
++            or inp.dtype not in (torch.float16, torch.bfloat16)
++            or inp.ndim == 0
++        ):
++            return None
++        hidden = int(inp.shape[-1])
++        if hidden <= 0 or inp.numel() % hidden != 0:
++            return None
++        rows = inp.numel() // hidden
++        _, tp2_remote, tp4_remote, tp8_owner = state.transport_policy
++        if (
++            state.world_size == 8
++            and tp8_owner
++            and hidden in (4096, 6144)
++            and 2 <= rows <= 8
++        ):
++            return "stage_tp8_owner"
++        if (
++            state.world_size == 4
++            and tp4_remote
++            and hidden in (4096, 6144)
++            and 1 <= rows <= 32
++        ):
++            return "stage_remote_push"
++        if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
++            return "stage_remote_push"
++        return None
++
+     @classmethod
+     def _fused_launch_config(
+         cls,
+@@ -1360,17 +1457,20 @@ class _CuTeOneshotBackend:
+         if override > 0:
+             ctas_per_row = override
+         else:
+-            min_ctas = (
+-                hidden_packs + threads * _REG_PACKS - 1
+-            ) // (threads * _REG_PACKS)
++            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
++                threads * _REG_PACKS
++            )
+             ctas_per_row = max(max(1, 3 // rows), min_ctas)
+         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
+-        register_normalize = (
+-            hidden_packs + ctas_per_row * threads - 1
+-        ) // (ctas_per_row * threads) <= _REG_PACKS
+-        if state.eager_tables is None:
++        register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
++            ctas_per_row * threads
++        ) <= _REG_PACKS
++        topology_mode = cls._fused_topology_mode(state, inp)
++        if topology_mode is not None:
++            mode = topology_mode
++        elif state.eager_tables is None:
+             mode = "registered"
+-        elif _push_mode_enabled():
++        elif state.transport_policy[0]:
+             mode = "stage_push"
+         else:
+             mode = "stage_pull"
+@@ -1378,11 +1478,7 @@ class _CuTeOneshotBackend:
+ 
+     @staticmethod
+     def _device_index(device: torch.device) -> int:
+-        return (
+-            device.index
+-            if device.index is not None
+-            else torch.cuda.current_device()
+-        )
++        return device.index if device.index is not None else torch.cuda.current_device()
+ 
+     def prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
+         """Compile/load every graph slot variant without launching a kernel."""
+@@ -1412,7 +1508,10 @@ class _CuTeOneshotBackend:
+         """Compile/load fused graph variants without launching a kernel."""
+ 
+         state = self._state(handle)
+-        if state.eager_tables is None and int(inp.data_ptr()) not in state.registered_tables:
++        if (
++            state.eager_tables is None
++            and int(inp.data_ptr()) not in state.registered_tables
++        ):
+             raise RuntimeError("input buffer is not registered")
+         mode, single_cta, register_normalize, threads = self._fused_launch_config(
+             state, inp
+@@ -1421,9 +1520,7 @@ class _CuTeOneshotBackend:
+ 
+         device_index = self._device_index(inp.device)
+         variants = (
+-            ((True, 0), (True, 1))
+-            if state.eager_tables is not None
+-            else ((False, 0),)
++            ((True, 0), (True, 1)) if state.eager_tables is not None else ((False, 0),)
+         )
+         for device_slot_selection, slot_bias in variants:
+             get_fused_oneshot_launcher(
+@@ -1440,9 +1537,7 @@ class _CuTeOneshotBackend:
+             )
+ 
+     @staticmethod
+-    def _select_table(
+-        state: _CuTeOneshotState, input_pointer: int
+-    ) -> tuple[int, bool]:
++    def _select_table(state: _CuTeOneshotState, input_pointer: int) -> tuple[int, bool]:
+         if state.eager_tables is not None:
+             if state.device_slot_selection:
+                 # The two 16-entry tables are adjacent in rank_data.  A
+@@ -1477,9 +1572,7 @@ class _CuTeOneshotBackend:
+             capturing and state.eager_tables is not None
+         )
+         prospective_slot_bias = (
+-            state.slot_bias
+-            if state.device_slot_selection
+-            else state.eager_slot & 1
++            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
+         )
+         if capturing:
+             from ._oneshot_cute import is_oneshot_launcher_prepared
+@@ -1498,7 +1591,11 @@ class _CuTeOneshotBackend:
+                     "cold PCIe oneshot CUDA graph capture is not allowed; "
+                     "call prepare_graph_all_reduce() before capture"
+                 )
+-        if capturing and state.eager_tables is not None and not state.device_slot_selection:
++        if (
++            capturing
++            and state.eager_tables is not None
++            and not state.device_slot_selection
++        ):
+             # The graph epoch begins at zero.  Bias it to the host slot that
+             # would have been selected for this invocation, then keep both
+             # values fixed in the captured specialization.
+@@ -1563,9 +1660,7 @@ class _CuTeOneshotBackend:
+             capturing and state.eager_tables is not None
+         )
+         prospective_slot_bias = (
+-            state.slot_bias
+-            if state.device_slot_selection
+-            else state.eager_slot & 1
++            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
+         )
+         if capturing:
+             from ._oneshot_cute import is_fused_oneshot_launcher_prepared
+@@ -1602,9 +1697,9 @@ class _CuTeOneshotBackend:
+         if override > 0:
+             ctas_per_row = override
+         else:
+-            min_ctas = (
+-                hidden_packs + threads * _REG_PACKS - 1
+-            ) // (threads * _REG_PACKS)
++            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
++                threads * _REG_PACKS
++            )
+             ctas_per_row = max(max(1, 3 // rows), min_ctas)
+         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
+         assert single_cta_check == (ctas_per_row == 1)
+@@ -1650,7 +1745,7 @@ class _CuTeOneshotBackend:
+                 hidden_packs,
+                 rows,
+                 ctas_per_row,
+-                inp.numel() // pack_elems,
++                int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
+                 float(epsilon),
+                 blocks,
+             )
+@@ -1664,9 +1759,7 @@ class _CuTeOneshotBackend:
+     def register_graph_buffers(self, handle: int, handles, offsets) -> None:
+         self._state(handle)
+         if any(handles) or any(offsets):
+-            raise RuntimeError(
+-                "CuTe oneshot graph capture requires eager IPC buffers"
+-            )
++            raise RuntimeError("CuTe oneshot graph capture requires eager IPC buffers")
+ 
+     def dispose(self, handle: int) -> None:
+         with self._lock:
+@@ -1766,6 +1859,7 @@ class PCIeOneshotAllReduce:
+             normalized_eager_bytes = (
+                 None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+             )
++            normalized_transport_policy = _transport_policy_contract()
+             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                 raise ValueError(f"unsupported world size {normalized_world_size}")
+             if not 0 <= normalized_rank < normalized_world_size:
+@@ -1832,6 +1926,7 @@ class PCIeOneshotAllReduce:
+                 normalized_eager0,
+                 normalized_eager1,
+                 normalized_eager_bytes,
++                normalized_transport_policy,
+                 normalized_max_size,
+                 normalized_rank_data_bytes,
+             )
+@@ -1853,6 +1948,7 @@ class PCIeOneshotAllReduce:
+             normalized_eager0,
+             normalized_eager1,
+             normalized_eager_bytes,
++            normalized_transport_policy,
+             normalized_max_size,
+             normalized_rank_data_bytes,
+         ) = normalized
+@@ -1865,6 +1961,7 @@ class PCIeOneshotAllReduce:
+             eager_buffer_ptrs0=normalized_eager0,
+             eager_buffer_ptrs1=normalized_eager1,
+             eager_buffer_bytes=normalized_eager_bytes,
++            transport_policy=normalized_transport_policy,
+             exchange_group=resolved_group,
+             ipc=ipc,
+             owned_buffers=owned_buffers,
+@@ -1911,6 +2008,7 @@ class PCIeOneshotAllReduce:
+                     self.rank_data_bytes,
+                     self.eager_buffer_bytes,
+                     self._pending_eager_ptrs is not None,
++                    self._transport_policy,
+                 ),
+             )
+ 
+@@ -1941,6 +2039,7 @@ class PCIeOneshotAllReduce:
+         eager_buffer_ptrs0: Optional[Sequence[int]],
+         eager_buffer_ptrs1: Optional[Sequence[int]],
+         eager_buffer_bytes: Optional[int],
++        transport_policy: tuple[bool, bool, bool, bool],
+         exchange_group: Optional[ProcessGroup],
+         ipc: Optional[CudaRTLibrary],
+         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
+@@ -1959,6 +2058,11 @@ class PCIeOneshotAllReduce:
+         self.eager_buffer_bytes = (
+             None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+         )
++        self._transport_policy = tuple(bool(value) for value in transport_policy)
++        self._sharded_eager_storage = _uses_sharded_eager_storage(
++            self.world_size,
++            self._transport_policy,
++        )
+         self._ipc = ipc
+         self._ext = ext_module
+         self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
+@@ -1993,11 +2097,24 @@ class PCIeOneshotAllReduce:
+             )
+             if self._pending_eager_ptrs is not None:
+                 self._eager_ptrs = self._pending_eager_ptrs
+-                self._ext.register_pcie_buffers(
+-                    self._ptr,
+-                    list(self._eager_ptrs[0]),
+-                    list(self._eager_ptrs[1]),
+-                )
++                if getattr(
++                    self._ext,
++                    "supports_eager_storage_contract",
++                    False,
++                ):
++                    self._ext.register_pcie_buffers(
++                        self._ptr,
++                        list(self._eager_ptrs[0]),
++                        list(self._eager_ptrs[1]),
++                        self.eager_buffer_bytes,
++                        self._transport_policy,
++                    )
++                else:
++                    self._ext.register_pcie_buffers(
++                        self._ptr,
++                        list(self._eager_ptrs[0]),
++                        list(self._eager_ptrs[1]),
++                    )
+         except Exception as exc:
+             init_error = exc
+         finally:
+@@ -2068,6 +2185,7 @@ class PCIeOneshotAllReduce:
+             normalized_eager_bytes = int(eager_buffer_bytes)
+             normalized_max_size = int(max_size)
+             normalized_rank_data_bytes = int(rank_data_bytes)
++            normalized_transport_policy = _transport_policy_contract()
+             if world_size not in SUPPORTED_WORLD_SIZES:
+                 raise ValueError(f"unsupported world size {world_size}")
+             if device_obj.type != "cuda":
+@@ -2085,14 +2203,19 @@ class PCIeOneshotAllReduce:
+                 normalized_eager_bytes,
+                 normalized_max_size,
+                 normalized_rank_data_bytes,
++                normalized_transport_policy,
+             )
+ 
+-        device_obj, eager_buffer_bytes, max_size, rank_data_bytes = (
+-            _run_collective_preallocation_setup(
+-                owner="PCIe oneshot argument validation",
+-                exchange_group=exchange_group,
+-                setup=validate_factory_arguments,
+-            )
++        (
++            device_obj,
++            eager_buffer_bytes,
++            max_size,
++            rank_data_bytes,
++            transport_policy,
++        ) = _run_collective_preallocation_setup(
++            owner="PCIe oneshot argument validation",
++            exchange_group=exchange_group,
++            setup=validate_factory_arguments,
+         )
+ 
+         _require_full_grid_residency(
+@@ -2121,7 +2244,7 @@ class PCIeOneshotAllReduce:
+                 eager_buffer_bytes,
+                 max_size,
+                 rank_data_bytes,
+-                _push_mode_enabled(),
++                transport_policy,
+             ),
+         )
+ 
+@@ -2129,6 +2252,10 @@ class PCIeOneshotAllReduce:
+             exchange_group,
+             signal_bytes=signal_bytes,
+             eager_buffer_bytes=eager_buffer_bytes,
++            sharded_eager_storage=_uses_sharded_eager_storage(
++                world_size,
++                transport_policy,
++            ),
+             ipc=ipc,
+         )
+         owned_buffers = [channel_buffers.owned_buffer]
+@@ -2140,6 +2267,7 @@ class PCIeOneshotAllReduce:
+             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+             eager_buffer_bytes=eager_buffer_bytes,
++            transport_policy=transport_policy,
+             exchange_group=exchange_group,
+             ipc=ipc,
+             owned_buffers=owned_buffers,
+@@ -2399,6 +2527,7 @@ class PCIeOneshotAllReduce:
+         *,
+         signal_bytes: int,
+         eager_buffer_bytes: int,
++        sharded_eager_storage: bool,
+         ipc: CudaRTLibrary,
+     ) -> _ChannelSharedBuffers:
+         signal_bytes = int(signal_bytes)
+@@ -2407,7 +2536,7 @@ class PCIeOneshotAllReduce:
+             raise ValueError("signal_bytes must be positive")
+         if eager_buffer_bytes <= 0:
+             raise ValueError("eager_buffer_bytes must be positive")
+-        if _push_mode_enabled():
++        if sharded_eager_storage:
+             eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
+ 
+         signal_offset = 0
+@@ -2523,7 +2652,9 @@ class PCIeOneshotAllReduce:
+         if not self.should_allreduce(inp) or inp.ndim == 0:
+             raise ValueError("input does not satisfy fused PCIe oneshot requirements")
+         if inp.shape[-1] * inp.element_size() % 16 != 0:
+-            raise ValueError("the last input dimension must occupy a multiple of 16 bytes")
++            raise ValueError(
++                "the last input dimension must occupy a multiple of 16 bytes"
++            )
+         self._check_stream()
+         self._prepare_input(inp, peer_input_ptrs)
+         self._ext.prepare_fused_all_reduce(self._ptr, inp)
+@@ -3030,6 +3161,7 @@ class PCIeOneshotAllReducePool:
+             normalized_rank_data_bytes = int(rank_data_bytes)
+             normalized_single_channel = bool(single_channel)
+             normalized_max_concurrent_channels = int(max_concurrent_channels)
++            normalized_transport_policy = _transport_policy_contract()
+             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                 raise ValueError(f"unsupported world size {normalized_world_size}")
+             if not 0 <= normalized_rank < normalized_world_size:
+@@ -3075,6 +3207,7 @@ class PCIeOneshotAllReducePool:
+                 normalized_rank_data_bytes,
+                 normalized_single_channel,
+                 normalized_max_concurrent_channels,
++                normalized_transport_policy,
+             )
+ 
+         if channel_factory is None and resolved_group is not None:
+@@ -3095,7 +3228,12 @@ class PCIeOneshotAllReducePool:
+             self.rank_data_bytes,
+             self.single_channel,
+             self.max_concurrent_channels,
++            self._transport_policy,
+         ) = normalized
++        self._sharded_eager_storage = _uses_sharded_eager_storage(
++            self.world_size,
++            self._transport_policy,
++        )
+         self.exchange_group = resolved_group
+         self.process_group = self.exchange_group
+         self._channel_factory = channel_factory
+@@ -3145,7 +3283,7 @@ class PCIeOneshotAllReducePool:
+                     self.rank_data_bytes,
+                     self.single_channel,
+                     self.max_concurrent_channels,
+-                    _push_mode_enabled(),
++                    self._transport_policy,
+                 ),
+             )
+             # A genuine single-channel pool has no independent eager/graph
+@@ -3223,6 +3361,7 @@ class PCIeOneshotAllReducePool:
+             self.exchange_group,
+             signal_bytes=self._signal_bytes,
+             eager_buffer_bytes=self.eager_buffer_bytes,
++            sharded_eager_storage=self._sharded_eager_storage,
+             ipc=self._ipc,
+         )
+         owned_buffers = [channel_buffers.owned_buffer]
+@@ -3234,6 +3373,7 @@ class PCIeOneshotAllReducePool:
+             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+             eager_buffer_bytes=self.eager_buffer_bytes,
++            transport_policy=self._transport_policy,
+             exchange_group=self.exchange_group,
+             ipc=self._ipc,
+             owned_buffers=owned_buffers,
+@@ -3486,9 +3626,7 @@ class PCIeOneshotAllReducePool:
+                         inp, peer_input_ptrs=peer_input_ptrs
+                     )
+             else:
+-                channel.prepare_graph_all_reduce(
+-                    inp, peer_input_ptrs=peer_input_ptrs
+-                )
++                channel.prepare_graph_all_reduce(inp, peer_input_ptrs=peer_input_ptrs)
+ 
+     def prepare_graph_fused_add_rms_norm(
+         self,
+diff --git a/b12x/moe/_shared/kernels/w4a16/host.py b/b12x/moe/_shared/kernels/w4a16/host.py
+index 6517d2883880bd41438ac6b85c8272488593ddd3..868ef398adef1332d677e5cbc4386431ea9b8501 100644
+--- a/b12x/moe/_shared/kernels/w4a16/host.py
++++ b/b12x/moe/_shared/kernels/w4a16/host.py
+@@ -190,6 +190,32 @@ def route_pack_token_capacity(tokens: int, topk: int) -> int:
+     return 1 << (max(int(tokens), 1) - 1).bit_length()
+ 
+ 
++def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
++    """Return live row counts covering capacity and scalar specializations.
++
++    Triton specializes the runtime ``live_numel`` scalar on alignment as well
++    as the constexpr route-capacity bucket. For a power-of-two bucket, the
++    bucket maximum and its first live member cover both alignment classes
++    reached by the GLM top-k route counts (for example 8 and 5 rows in the
++    8-row bucket). Warming only bucket maxima leaves the less-aligned variant
++    to compile on the first odd-sized request.
++    """
++    capacity = int(capacity)
++    if capacity < 1:
++        raise ValueError(f"route-pack warmup capacity must be positive, got {capacity}")
++    counts: list[int] = []
++    bucket = 1
++    while True:
++        first_in_bucket = 1 if bucket == 1 else bucket // 2 + 1
++        if first_in_bucket > capacity:
++            break
++        for count in (first_in_bucket, min(bucket, capacity)):
++            if not counts or counts[-1] != count:
++                counts.append(count)
++        bucket *= 2
++    return tuple(counts)
++
++
+ def route_pack_capacity(
+     numel: int,
+     block_size: int,
+@@ -405,6 +431,7 @@ __all__ = [
+     "route_pack_numel_capacity",
+     "route_pack_capacity",
+     "route_pack_token_capacity",
++    "route_pack_warmup_token_counts",
+     "select_route_block_size_m",
+     "unswizzle_block_scale",
+     "unswizzle_expert_scales",
+diff --git a/b12x/moe/_shared/kernels/w4a16/kernel.py b/b12x/moe/_shared/kernels/w4a16/kernel.py
+index 1d0baeddc379086b325ef1c98de9a70f4697660b..51c18da5ee6875e72fa55fcac0a9ba263ae5e112 100644
+--- a/b12x/moe/_shared/kernels/w4a16/kernel.py
++++ b/b12x/moe/_shared/kernels/w4a16/kernel.py
+@@ -441,7 +441,17 @@ def _candidate_tile_fits(
+         or int(tile_k) % scale_group_size != 0
+     ):
+         return False
+-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
++    ultra_wide_fc2 = (
++        int(tile_n) == 512
++        and int(tile_k) == 32
++        and int(cta_threads) == 256
++        and _scale_group_size(scale_format) == 32
++    )
++    if (
++        int(tile_n) < 64
++        or (int(tile_k) < 64 and not ultra_wide_fc2)
++        or int(cta_threads) < 128
++    ):
+         return False
+     smem_bytes = _shared_memory_footprint(
+         cta_m_blocks=cta_m_blocks,
+@@ -1963,7 +1973,7 @@ class W4A16GemmKernel:
+             reduce_slice_idx,
+             lock_slot,
+             active_size_m,
+-            -1,
++            Int32(0),
+         )
+ 
+     @cute.jit
+@@ -2466,6 +2476,7 @@ class W4A16GemmKernel:
+             a_rows_per_iter,
+             output_n_tile,
+             expert_idx,
++            -1,
+         )
+ 
+         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
+@@ -2478,6 +2489,8 @@ class W4A16GemmKernel:
+             s_sh_rd,
+             Int32(0),
+             Int32(0),
++            Int32(0),
++            0,
+         )
+         a0_regs_cur = cute.make_rmem_tensor((2,), Uint32)
+         a0_regs_next = cute.make_rmem_tensor((2,), Uint32)
+@@ -2524,6 +2537,7 @@ class W4A16GemmKernel:
+             a_rows_per_iter,
+             output_n_tile,
+             expert_idx,
++            0,
+         )
+ 
+         self._finish_tile(
+@@ -2979,6 +2993,7 @@ class W4A16GemmKernel:
+         a_rows_per_iter: Int32,
+         output_n_tile: Int32,
+         expert_idx: Int32,
++        dynamic_pair_override: cutlass.Constexpr[int],
+     ):
+         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+         tile_idx = Int32(0)
+@@ -3000,6 +3015,7 @@ class W4A16GemmKernel:
+                             kk,
+                             tile_idx,
+                             k_tiles,
++                            dynamic_pair_override,
+                         )
+ 
+                         self._prefetch_pipeline_step(
+@@ -3028,6 +3044,7 @@ class W4A16GemmKernel:
+                             a_rows_per_iter,
+                             output_n_tile,
+                             expert_idx,
++                            dynamic_pair_override,
+                         )
+ 
+                         for jj in cutlass.range_constexpr(4):
+@@ -3068,6 +3085,8 @@ class W4A16GemmKernel:
+                     s_sh_rd,
+                     Int32(0),
+                     Int32(0),
++                    tile_idx,
++                    dynamic_pair_override,
+                 )
+                 self._load_a_registers_m8_bundle(
+                     a0_regs_cur,
+@@ -3856,6 +3875,7 @@ class W4A16GemmKernel:
+         kk: cutlass.Constexpr[int],
+         tile_idx: Int32,
+         k_tiles: Int32,
++        dynamic_pair_override: cutlass.Constexpr[int],
+     ):
+         self._clear_b_scale_register_bundle(b_scale_next)
+         self._clear_a_register_bundle_m8(a0_regs_next)
+@@ -3871,6 +3891,8 @@ class W4A16GemmKernel:
+                     s_sh_rd,
+                     Int32(pipe),
+                     Int32(kk + 1),
++                    tile_idx,
++                    dynamic_pair_override,
+                 )
+                 self._load_a_registers_m8_bundle(
+                     a0_regs_next,
+@@ -3898,6 +3920,8 @@ class W4A16GemmKernel:
+                     s_sh_rd,
+                     next_pipe,
+                     Int32(0),
++                    next_tile,
++                    dynamic_pair_override,
+                 )
+                 self._load_a_registers_m8_bundle(
+                     a0_regs_next,
+@@ -4199,12 +4223,10 @@ class W4A16GemmKernel:
+             for jj in cutlass.range_constexpr(4):
+                 local_n16 = Int32(4) * w_n + Int32(jj)
+                 tile_base = Int32(0)
+-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
+-                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
+-                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+-                        b_region, tile_base, lane, low_bits
+-                    )
+-                elif logical_k16 < Int32(8):
++                if (
++                    cutlass.const_expr(int(low_bits) == int(high_bits))
++                    or logical_k16 < Int32(8)
++                ):
+                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
+                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                         b_region, tile_base, lane, low_bits
+@@ -11241,6 +11263,28 @@ def _trellis_dense_buffer(
+     return buffer
+ 
+ 
++def _use_k6_mcg_small(
++    *,
++    device: torch.device,
++    m: int,
++    trellis_bits: int,
++    trellis_codebook: str,
++    trellis_pair_kind,
++    compute_dtype: torch.dtype,
++    external_hadamard_128,
++) -> bool:
++    """Select the capture-safe K6/MCG kernel only on its compiled target."""
++    return (
++        tuple(torch.cuda.get_device_capability(device)) == (12, 0)
++        and m <= 128
++        and trellis_bits == 6
++        and trellis_codebook == "mcg"
++        and trellis_pair_kind is None
++        and compute_dtype == torch.float16
++        and external_hadamard_128 is None
++    )
++
++
+ def _run_trellis256_dense_current_device(
+     x: torch.Tensor,
+     prepared_dense,
+@@ -11324,6 +11368,70 @@ def _run_trellis256_dense_current_device(
+         None if hadamard_128 is None else _resolve_exl3_hadamard_128(hadamard_128)
+     )
+ 
++    # Keep the established K6/MCG decode path independent from the generic
++    # Trellis scheduler. It owns both H128 rotations, needs no GEMM scratch,
++    # and is safe to capture with only caller-owned output/rotation storage.
++    # Compact pair payloads and the newer SQG codebooks use the generic path.
++    use_k6_mcg_small = _use_k6_mcg_small(
++        device=x.device,
++        m=m,
++        trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
++        trellis_pair_kind=trellis_pair_kind,
++        compute_dtype=compute_dtype,
++        external_hadamard_128=external_hadamard_128,
++    )
++    if use_k6_mcg_small:
++        if x.dtype == torch.float16:
++            x_f16 = x
++        else:
++            input_f16 = _trellis_dense_buffer(
++                "input_f16",
++                input_f16,
++                shape=(m, size_k),
++                dtype=torch.float16,
++                device=x.device,
++            )
++            input_f16.copy_(x)
++            x_f16 = input_f16
++        rotated_f16 = _trellis_dense_buffer(
++            "rotated_f16",
++            rotated_f16,
++            shape=(m, size_k),
++            dtype=torch.float16,
++            device=x.device,
++        )
++        if output.dtype == torch.float16:
++            small_output = output
++        else:
++            output_f16 = _trellis_dense_buffer(
++                "output_f16",
++                output_f16,
++                shape=(m, size_n),
++                dtype=torch.float16,
++                device=x.device,
++            )
++            small_output = output_f16
++        from b12x.gemm.trellis_linear._small_m import run_k6_mcg
++
++        trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
++            size_k // 16,
++            size_n // 16,
++            96,
++        )
++        run_k6_mcg(
++            x_f16,
++            trellis_i16,
++            small_output,
++            prepared_dense.suh,
++            rotated_f16,
++            prepared_dense.svh,
++            prepared_dense.workspace,
++        )
++        if output.dtype != torch.float16:
++            output.copy_(small_output)
++        return output
++
+     gemm_output = _trellis_dense_buffer(
+         "gemm_output",
+         gemm_output,
+diff --git a/b12x/moe/_shared/kernels/w4a16/mixed_trellis.py b/b12x/moe/_shared/kernels/w4a16/mixed_trellis.py
+index a97ee2e62b57463012fd2aaa64edb59cbdd452ab..d9a5e9ab471fdfb34cbbe6b739e47f0314be7de5 100644
+--- a/b12x/moe/_shared/kernels/w4a16/mixed_trellis.py
++++ b/b12x/moe/_shared/kernels/w4a16/mixed_trellis.py
+@@ -27,7 +27,11 @@ from b12x._lib.intrinsics import shared_ptr_to_u32
+ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
+ from b12x._lib.utils import current_cuda_stream, make_ptr
+ 
+-from .host import max_packed_route_slots, packed_gemm_scratch_elements
++from .host import (
++    max_packed_route_slots,
++    packed_gemm_scratch_elements,
++    route_pack_warmup_token_counts,
++)
+ from .kernel import (
+     W4A16FusedMoeKernel,
+     _cutlass_element_dtype,
+@@ -245,6 +249,9 @@ class W4A16MixedTrellisKernel:
+         factor = gemm.schedule_route_block_factor
+         first_route_block = route_block_idx * Int32(factor)
+         first_lock_slot = lock_slot * Int32(factor)
++        # Mixed K3/K4 execution is pinned to the MCG codebook, whose tile
++        # decoder does not consume the generic Trellis LUT ABI slot.
++        trellis_lut_addr = cutlass.Int64(0)
+         if cutlass.const_expr(gemm.paired_m8_routes):
+             gemm._run_tile_m8_pair(
+                 a_flat,
+@@ -257,6 +264,7 @@ class W4A16MixedTrellisKernel:
+                 topk_weights,
+                 c_tmp,
+                 locks,
++                trellis_lut_addr,
+                 smem_base,
+                 tid,
+                 first_route_block,
+@@ -282,6 +290,7 @@ class W4A16MixedTrellisKernel:
+                     topk_weights,
+                     c_tmp,
+                     locks,
++                    trellis_lut_addr,
+                     smem_base,
+                     tid,
+                     first_route_block + Int32(subtile),
+@@ -761,6 +770,10 @@ class W4A16MixedTrellisKernel:
+             gate_suh,
+             up_suh,
+             descriptor_map,
++            # Mixed tier emit hooks own Trellis decoding, so the shared
++            # driver's LUT ABI slots are intentionally unused.
++            cutlass.Int64(0),
++            cutlass.Int64(0),
+             total_experts,
+             total_experts,
+             smem_base,
+@@ -774,6 +787,67 @@ class W4A16MixedTrellisKernel:
+ 
+ 
+ _CACHE: dict[tuple[object, ...], MixedTrellisCompileResult] = {}
++_ROUTE_PACK_WARMED: set[tuple[object, ...]] = set()
++
++
++def warmup_mixed_trellis_route_pack(
++    launch: MixedTrellisCompileResult,
++    buffers: MixedTrellisBuffers,
++    *,
++    expert_map: torch.Tensor,
++) -> int:
++    """Materialize every route-pack specialization reachable by ``launch``.
++
++    Route packing buckets token capacity to powers of two. A profile pass at
++    the maximum batch therefore does not cover smaller decode, speculative,
++    or final-prefill-chunk buckets. Load those CUDA modules eagerly while the
++    serving framework is still profiling persistent memory, so KV sizing sees
++    their real driver footprint instead of discovering it under live traffic.
++    """
++    device = buffers.packed_route_indices.device
++    if device.type != "cuda":
++        raise RuntimeError("mixed Trellis route-pack warmup requires CUDA buffers")
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("mixed Trellis route-pack warmup cannot run during capture")
++
++    total_experts = int(launch.tier0_num_experts) + int(launch.tier1_num_experts)
++    warmed = 0
++    pending_keys: list[tuple[object, ...]] = []
++    with torch.cuda.device(device):
++        device_index = int(torch.cuda.current_device())
++        for token_count in route_pack_warmup_token_counts(launch.size_m):
++            key = (
++                device_index,
++                str(launch.route_ids_dtype),
++                int(token_count),
++                int(launch.top_k),
++                total_experts,
++                int(launch.moe_block_size),
++                True,
++            )
++            if key in _ROUTE_PACK_WARMED:
++                continue
++            dummy_topk_ids = torch.zeros(
++                (token_count, launch.top_k),
++                dtype=launch.route_ids_dtype,
++                device=device,
++            )
++            pack_topk_routes_by_expert(
++                dummy_topk_ids,
++                launch.moe_block_size,
++                total_experts,
++                expert_map=expert_map,
++                packed_route_indices=buffers.packed_route_indices,
++                block_expert_ids=buffers.block_expert_ids,
++                packed_route_count=buffers.packed_route_count,
++                expert_offsets=buffers.expert_offsets,
++                expert_counts=buffers.expert_counts,
++            )
++            pending_keys.append(key)
++            warmed += 1
++        torch.cuda.current_stream(device).synchronize()
++        _ROUTE_PACK_WARMED.update(pending_keys)
++    return warmed
+ 
+ 
+ def compile_mixed_trellis(
+@@ -834,6 +908,7 @@ def compile_mixed_trellis(
+             scale_format="e4m3_k32",
+             w13_layout="trellis3_t256_proj",
+             trellis_bits=bits,
++            trellis_codebook="mcg",
+             intermediate_rotation=True,
+             full_rotation=True,
+             rotation_input_dtype=rotation_input_dtype,
+@@ -1521,4 +1596,5 @@ __all__ = [
+     "compile_mixed_trellis",
+     "make_mixed_trellis_buffers",
+     "run_mixed_trellis",
++    "warmup_mixed_trellis_route_pack",
+ ]
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index 47b08f478ccb030d333b94467f30cf036ddb3572..7f7b0fbd5babb6b3c5b0d02e2876162038cdbab8 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -6527,7 +6527,10 @@ def _plan_full_rotation_w4a16_launches(
+     if torch.cuda.is_current_stream_capturing():
+         raise RuntimeError("Trellis launch planning cannot run during capture")
+ 
+-    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
++    from b12x.moe._shared.kernels.w4a16.host import (
++        route_pack_capacity,
++        route_pack_warmup_token_counts,
++    )
+     from b12x.moe._shared.kernels.w4a16.kernel import (
+         _DEFAULT_MAX_SHARED_MEM,
+         compile_w4a16_fused_moe,
+@@ -6637,68 +6640,80 @@ def _plan_full_rotation_w4a16_launches(
+             for ids_dtype in (torch.int32, torch.int64)
+             for mapped in (False, True)
+         )
+-        for mapped in (False, True):
+-            route_pack_key = (
+-                core_plan.device.type,
+-                int(torch.cuda.current_device()),
+-                capacity_tokens * core_plan.num_topk,
+-                int(block_size_m),
+-                int(core_plan.route_E),
+-                mapped,
+-            )
+-            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+-                continue
++        packed_route_indices = torch.empty(
++            capacity_route_slots,
++            dtype=torch.int32,
++            device=core_plan.device,
++        )
++        block_expert_ids = torch.empty(
++            capacity_m_blocks,
++            dtype=torch.int32,
++            device=core_plan.device,
++        )
++        packed_route_count = torch.empty(
++            1,
++            dtype=torch.int32,
++            device=core_plan.device,
++        )
++        expert_offsets = torch.empty(
++            core_plan.route_E + 1,
++            dtype=torch.int32,
++            device=core_plan.device,
++        )
++        expert_counts = torch.empty(
++            core_plan.route_E,
++            dtype=torch.int32,
++            device=core_plan.device,
++        )
++        pending_route_pack_keys: list[tuple[object, ...]] = []
++        for route_ids_dtype in (torch.int32, torch.int64):
+             dummy_topk_ids = torch.zeros(
+                 capacity_tokens,
+                 core_plan.num_topk,
+-                dtype=torch.int32,
+-                device=core_plan.device,
+-            )
+-            packed_route_indices = torch.empty(
+-                capacity_route_slots,
+-                dtype=torch.int32,
+-                device=core_plan.device,
+-            )
+-            block_expert_ids = torch.empty(
+-                capacity_m_blocks,
+-                dtype=torch.int32,
+-                device=core_plan.device,
+-            )
+-            packed_route_count = torch.empty(
+-                1,
+-                dtype=torch.int32,
+-                device=core_plan.device,
+-            )
+-            expert_offsets = torch.empty(
+-                core_plan.route_E + 1,
+-                dtype=torch.int32,
+-                device=core_plan.device,
+-            )
+-            expert_counts = torch.empty(
+-                core_plan.route_E,
+-                dtype=torch.int32,
++                dtype=route_ids_dtype,
+                 device=core_plan.device,
+             )
+-            expert_map = None
+-            if mapped:
+-                expert_map = torch.arange(
+-                    core_plan.route_E,
+-                    dtype=torch.int32,
+-                    device=core_plan.device,
+-                )
+-            pack_topk_routes_by_expert(
+-                dummy_topk_ids,
+-                block_size_m,
+-                core_plan.route_E,
+-                expert_map=expert_map,
+-                packed_route_indices=packed_route_indices,
+-                block_expert_ids=block_expert_ids,
+-                packed_route_count=packed_route_count,
+-                expert_offsets=expert_offsets,
+-                expert_counts=expert_counts,
++            for mapped in (False, True):
++                expert_map = None
++                if mapped:
++                    expert_map = torch.arange(
++                        core_plan.route_E,
++                        dtype=torch.int32,
++                        device=core_plan.device,
++                    )
++                for token_count in route_pack_warmup_token_counts(capacity_tokens):
++                    route_pack_key = (
++                        core_plan.device.type,
++                        int(torch.cuda.current_device()),
++                        str(route_ids_dtype),
++                        token_count * core_plan.num_topk,
++                        int(block_size_m),
++                        int(core_plan.route_E),
++                        mapped,
++                    )
++                    if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
++                        continue
++                    pack_topk_routes_by_expert(
++                        dummy_topk_ids[:token_count],
++                        block_size_m,
++                        core_plan.route_E,
++                        expert_map=expert_map,
++                        packed_route_indices=packed_route_indices,
++                        block_expert_ids=block_expert_ids,
++                        packed_route_count=packed_route_count,
++                        expert_offsets=expert_offsets,
++                        expert_counts=expert_counts,
++                    )
++                    pending_route_pack_keys.append(route_pack_key)
++        torch.cuda.current_stream(core_plan.device).synchronize()
++        _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
++        if pending_route_pack_keys:
++            logger.info(
++                "Prewarmed %d full-rotation W4A16 route-pack variant(s) "
++                "for token capacity %d.",
++                len(pending_route_pack_keys),
++                capacity_tokens,
+             )
+-            torch.cuda.current_stream(core_plan.device).synchronize()
+-            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
+     return fused_launches, topk_sum_launches
+ 
+ 
+@@ -7031,6 +7046,7 @@ def _prewarm_w4a16_planned_launches(
+             route_pack_key = (
+                 workspace.device.type,
+                 int(torch.cuda.current_device()),
++                str(torch.int32),
+                 int(token_count) * int(workspace.num_topk),
+                 int(block_size_m),
+                 int(workspace.route_E),
+diff --git a/tests/attention/test_attention_mla_compressed.py b/tests/attention/test_attention_mla_compressed.py
+index d16f936d42d32bfa33114fd73fb9b3016fc51aa4..bdb70f9cac99e551bb1c5a8b97903055bb9151ba 100644
+--- a/tests/attention/test_attention_mla_compressed.py
++++ b/tests/attention/test_attention_mla_compressed.py
+@@ -23,17 +23,20 @@ from b12x.attention._shared.mla.compressed_reference import (
+     gather_compressed_mla_kv_cache_reference,
+     pack_compressed_mla_kv_cache_reference,
+ )
++from b12x.attention._shared.mla.api import clear_mla_caches
+ from b12x.attention._shared.mla.compressed_api import (
+     _should_use_sm121_single_pass_decode,
++    compressed_mla_decode_forward,
+ )
+-from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
+ from b12x.attention._shared.mla.compressed_config import (
++    compressed_mla_split_chunks_for_contract,
+     compressed_mla_split_config_for_contract,
+ )
+-from b12x.attention._shared.mla.api import clear_mla_caches
+-from b12x.attention._shared.mla.compressed_api import compressed_mla_decode_forward
+-from b12x.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
+-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, plan_compressed_mla_scratch
++from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
++from b12x.attention.compressed_mla._scratch import (
++    B12XCompressedMLAScratchCaps,
++    plan_compressed_mla_scratch,
++)
+ from b12x._lib.compiler import clear_compile_cache, compile_cache_info
+ 
+ from tests._reference.helpers import require_b12x
+@@ -218,6 +221,7 @@ def _make_compressed_binding(
+     v_head_dim: int = _COMPRESSED_HEAD_DIM,
+     max_chunks_per_row: int = 64,
+     max_page_table_width: int | None = None,
++    decode_row_capacity: int | None = None,
+ ):
+     plan = plan_compressed_mla_scratch(
+         B12XCompressedMLAScratchCaps(
+@@ -233,6 +237,7 @@ def _make_compressed_binding(
+             max_batch=rows,
+             max_kv_rows=max_kv_rows,
+             max_chunks_per_row=max_chunks_per_row,
++            decode_row_capacity=decode_row_capacity,
+         )
+     )
+     (spec,) = plan.scratch_specs()
+@@ -324,6 +329,160 @@ def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
+     assert larger_prefill_cfg.num_chunks == 1
+ 
+ 
++@pytest.mark.parametrize(
++    ("decode_row_capacity", "last_decode_row"),
++    [
++        pytest.param(144, 256, id="legacy-floor"),
++        pytest.param(384, 384, id="mns64-k5"),
++        pytest.param(512, 512, id="mns64-k7"),
++        pytest.param(768, 768, id="mns128-k5"),
++    ],
++)
++def test_compressed_mla_declared_decode_row_capacity_extends_contract(
++    decode_row_capacity: int,
++    last_decode_row: int,
++) -> None:
++    decode_cfg = compressed_mla_split_config_for_contract(
++        rows=last_decode_row,
++        width=384,
++        max_chunks=6,
++        decode_row_capacity=decode_row_capacity,
++    )
++    next_cfg = compressed_mla_split_config_for_contract(
++        rows=last_decode_row + 1,
++        width=384,
++        max_chunks=6,
++        decode_row_capacity=decode_row_capacity,
++    )
++
++    assert decode_cfg.chunk_size == 64
++    assert decode_cfg.num_chunks == 6
++    assert next_cfg.chunk_size == 1024
++    assert next_cfg.num_chunks == 1
++
++
++def test_compressed_mla_declared_decode_row_capacity_rejects_nonpositive() -> None:
++    with pytest.raises(ValueError, match="decode_row_capacity must be positive"):
++        compressed_mla_split_config_for_contract(
++            rows=1,
++            width=384,
++            max_chunks=6,
++            decode_row_capacity=0,
++        )
++
++
++@pytest.mark.parametrize("rows", [1, 24, 65, 144, 192, 256])
++@pytest.mark.parametrize("width", [128, 384, 2176, 4608])
++@pytest.mark.parametrize("decode_row_capacity", [144, 384, 768])
++def test_declared_capacity_preserves_legacy_plans_through_256_rows(
++    rows: int,
++    width: int,
++    decode_row_capacity: int,
++) -> None:
++    legacy = compressed_mla_split_config_for_contract(
++        rows=rows,
++        width=width,
++    )
++    declared = compressed_mla_split_config_for_contract(
++        rows=rows,
++        width=width,
++        decode_row_capacity=decode_row_capacity,
++    )
++
++    assert declared == legacy
++
++
++@pytest.mark.parametrize("rows", [384, 512, 768])
++@torch.inference_mode()
++def test_declared_decode_capacity_matches_reference_under_graph_replay(
++    rows: int,
++) -> None:
++    device = require_b12x()
++    clear_mla_caches()
++    width = 384
++    live_width = 32
++    q = _make_q(rows=rows, seed=6130 + rows, device=device)
++    swa_cache_bytes = _make_cache(
++        tokens=64,
++        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
++        seed=6131 + rows,
++        device=device,
++    )
++    swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
++    base_indices = torch.arange(live_width, dtype=torch.int32, device=device)
++    swa_indices = torch.full(
++        (rows, width),
++        -1,
++        dtype=torch.int32,
++        device=device,
++    )
++    swa_indices[:, :live_width] = base_indices
++    swa_lengths = torch.full(
++        (rows,),
++        live_width,
++        dtype=torch.int32,
++        device=device,
++    )
++    attn_sink = torch.linspace(
++        -0.1,
++        0.1,
++        _LOCAL_Q_HEADS,
++        dtype=torch.float32,
++        device=device,
++    )
++    split_cap = math.ceil(width / 64)
++    binding = _make_compressed_binding(
++        device=device,
++        rows=rows,
++        topk=width,
++        max_kv_rows=rows * width,
++        q=q,
++        swa_indices=swa_indices,
++        swa_lengths=swa_lengths,
++        use_cuda_graph=True,
++        max_chunks_per_row=split_cap,
++        decode_row_capacity=rows,
++    )
++
++    captured_out: torch.Tensor | None = None
++
++    def run() -> torch.Tensor:
++        nonlocal captured_out
++        captured_out = compressed_mla_decode_forward(
++            swa_k_cache=swa_cache,
++            binding=binding,
++            attn_sink=attn_sink,
++            sm_scale=_SM_SCALE,
++        )
++        return captured_out
++
++    run()
++    torch.cuda.synchronize(device)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    graph.replay()
++    torch.cuda.synchronize(device)
++    assert captured_out is not None
++
++    expected = compressed_sparse_mla_reference(
++        q,
++        swa_cache_bytes,
++        swa_indices,
++        swa_lengths,
++        attn_sink=attn_sink,
++        sm_scale=_SM_SCALE,
++    )
++    max_abs = (captured_out.float() - expected.float()).abs().max().item()
++    cosine = torch.nn.functional.cosine_similarity(
++        captured_out.float().reshape(-1),
++        expected.float().reshape(-1),
++        dim=0,
++    )
++    assert max_abs <= 0.10
++    assert cosine.item() >= 0.9995
++
++
+ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
+     device = require_b12x()
+     selected_widths = (128, 640, 2880)
+@@ -397,6 +556,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
+     assert legacy_ragged > capped * 3
+     assert capped < int(2.25 * (1 << 30))
+ 
++
+ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
+     device = require_b12x()
+     gen = torch.Generator(device=device)
+@@ -490,15 +650,18 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
+         max_page_table_width=page_table_width,
+     )
+ 
+-    with torch.inference_mode(), torch.no_grad():
+-        with pytest.raises(ValueError, match="mapped indexed_page_table"):
+-            compressed_api_impl.compressed_mla_decode_forward(
+-                swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
+-                binding=binding,
+-                indexed_k_cache=indexed_cache,
+-                indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+-                sm_scale=_SM_SCALE,
+-            )
++    with (
++        torch.inference_mode(),
++        torch.no_grad(),
++        pytest.raises(ValueError, match="mapped indexed_page_table"),
++    ):
++        compressed_api_impl.compressed_mla_decode_forward(
++            swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
++            binding=binding,
++            indexed_k_cache=indexed_cache,
++            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
++            sm_scale=_SM_SCALE,
++        )
+ 
+ 
+ @torch.inference_mode()
+@@ -910,7 +1073,9 @@ def test_compressed_mla_mapped_page_table_is_rejected() -> None:
+         swa_lengths=swa_lengths,
+         indexed_indices=torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0),
+         indexed_lengths=indexed_lengths,
+-        indexed_page_table=torch.arange(2, dtype=torch.int32, device=device).unsqueeze(0),
++        indexed_page_table=torch.arange(2, dtype=torch.int32, device=device).unsqueeze(
++            0
++        ),
+         use_cuda_graph=True,
+     )
+ 
+@@ -1164,8 +1329,7 @@ def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
+     for row in range(rows):
+         length = min(width, row + 1)
+         swa_indices[row, :length] = (
+-            torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
+-            % 64
++            torch.arange(row, row - length, -1, dtype=torch.int32, device=device) % 64
+         )
+         swa_lengths[row] = length
+     attn_sink = torch.linspace(
+diff --git a/tests/comm/test_pcie_oneshot.py b/tests/comm/test_pcie_oneshot.py
+index ffb61ba0d7e7657381aef79840fc49f526961f77..898b48f65544ef5086fb957726f0ad4be9b477d8 100644
+--- a/tests/comm/test_pcie_oneshot.py
++++ b/tests/comm/test_pcie_oneshot.py
+@@ -20,10 +20,14 @@ from b12x.comm.pcie.pcie_oneshot import (
+     _require_full_grid_residency,
+     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+     _RETAINED_FAILED_IPC_EXPORTS,
++    _CuTeOneshotBackend,
+     _CuTeOneshotState,
+     _enable_device_slot_selection,
++    _transport_policy_contract,
++    _uses_sharded_eager_storage,
+     parse_pcie_oneshot_max_size,
+ )
++from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -252,6 +256,178 @@ def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
+     assert state.slot_bias == 1
+ 
+ 
++def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotState:
++    transport_policy = _transport_policy_contract()
++    return _CuTeOneshotState(
++        rank=0,
++        world_size=world_size,
++        signal_ptrs=tuple(range(100, 100 + world_size)),
++        rank_data=torch.empty(256, dtype=torch.uint8),
++        signal_table_address=0,
++        next_table_offset=128,
++        registered_tables={},
++        eager_tables=(300, 400) if eager else None,
++        eager_buffer_bytes=128 * 1024 if eager else None,
++        transport_policy=transport_policy,
++        sharded_eager_storage=_uses_sharded_eager_storage(
++            world_size,
++            transport_policy,
++        ),
++    )
++
++
++def test_tp8_owner_launcher_rejects_float32() -> None:
++    with pytest.raises(ValueError, match="requires float16 or bfloat16"):
++        _FusedOneshotLaunch(
++            "float32",
++            world_size=8,
++            rank=0,
++            mode="stage_tp8_owner",
++            single_cta=True,
++            register_normalize=True,
++            device_slot_selection=False,
++            slot_bias=0,
++            threads=256,
++        )
++
++
++@pytest.mark.parametrize(
++    ("rows", "hidden", "dtype", "expected"),
++    (
++        (1, 6144, torch.bfloat16, "stage_pull"),
++        (2, 4096, torch.float16, "stage_tp8_owner"),
++        (4, 6144, torch.bfloat16, "stage_tp8_owner"),
++        (8, 6144, torch.bfloat16, "stage_tp8_owner"),
++        (9, 6144, torch.bfloat16, "stage_pull"),
++        (4, 8192, torch.bfloat16, "stage_pull"),
++        (4, 6144, torch.float32, "stage_pull"),
++    ),
++)
++def test_tp8_owner_reduce_default_has_a_bounded_shape_contract(
++    monkeypatch,
++    rows: int,
++    hidden: int,
++    dtype: torch.dtype,
++    expected: str,
++) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.delenv("B12X_PCIE_TP8_OWNER_REDUCE", raising=False)
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(8), torch.empty((rows, hidden), dtype=dtype)
++    )
++    assert mode == expected
++
++
++def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(8), torch.empty((4, 6144), dtype=torch.bfloat16)
++    )
++    assert mode == "stage_pull"
++
++
++@pytest.mark.parametrize(
++    ("world_size", "env_name", "shape", "expected_when_enabled"),
++    (
++        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 4096), "stage_remote_push"),
++        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (32, 6144), "stage_remote_push"),
++    ),
++)
++def test_tp2_tp4_remote_push_is_opt_in(
++    monkeypatch,
++    world_size: int,
++    env_name: str,
++    shape: tuple[int, int],
++    expected_when_enabled: str,
++) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.delenv(env_name, raising=False)
++    inp = torch.empty(shape, dtype=torch.bfloat16)
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(world_size), inp
++    )
++    assert mode == "stage_pull"
++
++    monkeypatch.setenv(env_name, "1")
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(world_size), inp
++    )
++    assert mode == expected_when_enabled
++
++
++def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
++    state = _make_cute_state(4)
++
++    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        state,
++        torch.empty((4, 6144), dtype=torch.bfloat16),
++    )
++
++    assert mode == "stage_remote_push"
++
++
++@pytest.mark.parametrize(
++    ("world_size", "env_name", "shape"),
++    (
++        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 6144)),
++        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (33, 4096)),
++        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (33, 6144)),
++        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (4, 8192)),
++    ),
++)
++def test_tp2_tp4_remote_push_falls_back_outside_qualified_shapes(
++    monkeypatch,
++    world_size: int,
++    env_name: str,
++    shape: tuple[int, int],
++) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.setenv(env_name, "1")
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(world_size),
++        torch.empty(shape, dtype=torch.bfloat16),
++    )
++    assert mode == "stage_pull"
++
++
++def test_registered_fused_input_never_selects_topology_transport(
++    monkeypatch,
++) -> None:
++    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
++    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(4, eager=False),
++        torch.empty((4, 6144), dtype=torch.bfloat16),
++    )
++    assert mode == "registered"
++
++
++def test_topology_transport_storage_policy_matches_opt_in_defaults(
++    monkeypatch,
++) -> None:
++    for name in (
++        "B12X_PCIE_ONESHOT_PUSH",
++        "B12X_PCIE_TP2_REMOTE_PUSH",
++        "B12X_PCIE_TP4_REMOTE_PUSH",
++        "B12X_PCIE_TP8_OWNER_REDUCE",
++    ):
++        monkeypatch.delenv(name, raising=False)
++
++    assert not _uses_sharded_eager_storage(2)
++    assert not _uses_sharded_eager_storage(4)
++    assert _uses_sharded_eager_storage(8)
++    assert _transport_policy_contract() == (False, False, False, True)
++
++    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
++    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
++    assert _uses_sharded_eager_storage(4)
++    assert not _uses_sharded_eager_storage(8)
++    assert _transport_policy_contract() == (False, False, True, False)
++
++
+ def test_register_buffer_is_idempotent_for_same_mapping():
+     runtime = _make_runtime()
+     ext = runtime._ext
+@@ -1218,6 +1394,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
+         exchange_group,
+         signal_bytes=signal_bytes,
+         eager_buffer_bytes=eager_bytes,
++        sharded_eager_storage=False,
+         ipc=ipc,
+     )
+ 
+@@ -1281,6 +1458,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
+             object(),
+             signal_bytes=300,
+             eager_buffer_bytes=128,
++            sharded_eager_storage=False,
+             ipc=ipc,
+         )
+ 
+@@ -1486,9 +1664,7 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
+         _requested, existing = local_state
+         return [local_state, (("other",), existing)]
+ 
+-    monkeypatch.setattr(
+-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+-    )
++    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+ 
+     with pytest.raises(RuntimeError, match="differs across ranks"):
+         pool.prepare_channels(("target",))
+@@ -1535,9 +1711,7 @@ def test_empty_logical_channel_set_still_enters_collective_contract(monkeypatch)
+         _, existing = local_state
+         return [local_state, (("peer-channel",), existing)]
+ 
+-    monkeypatch.setattr(
+-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+-    )
++    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+ 
+     with pytest.raises(RuntimeError, match="differs across ranks"):
+         pool.prepare_channels(())
+@@ -1599,9 +1773,7 @@ def test_collective_capture_allows_opposite_order_from_agreed_catalog(monkeypatc
+         assert requested == "graph:target"
+         return [local_state, ("graph:draft", catalog)]
+ 
+-    monkeypatch.setattr(
+-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+-    )
++    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+ 
+     with pool.capture(7, channel_id="graph:target") as channel:
+         assert channel is target
+@@ -1631,9 +1803,7 @@ def test_collective_capture_rejects_divergent_catalog_before_allocation(monkeypa
+             return [(), ()]
+         return [local_state, ("graph:target", ())]
+ 
+-    monkeypatch.setattr(
+-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+-    )
++    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+ 
+     with (
+         pytest.raises(RuntimeError, match="prepared channel catalog differs"),
+@@ -1665,9 +1835,7 @@ def test_collective_capture_rejects_differing_unprepared_ids(monkeypatch):
+         _, catalog = local_state
+         return [local_state, ("graph:unknown", catalog)]
+ 
+-    monkeypatch.setattr(
+-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+-    )
++    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+ 
+     with (
+         pytest.raises(RuntimeError, match="unprepared logical channels"),
+diff --git a/tests/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py b/tests/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
+index 8159ba77b76f81b11779e2fd1cddaff2e0339018..9ed9199c607a2e39d75c204cd5f4c0e588fd3593 100644
+--- a/tests/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
++++ b/tests/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
+@@ -12,7 +12,10 @@ import torch.distributed as dist
+ import torch.multiprocessing as mp
+ from cuda.bindings import runtime as cudart
+ 
+-from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
++from b12x.comm.pcie.pcie_oneshot import (
++    PCIeOneshotAllReducePool,
++    _CuTeOneshotBackend,
++)
+ 
+ 
+ pytestmark = pytest.mark.skipif(
+@@ -22,9 +25,7 @@ pytestmark = pytest.mark.skipif(
+         "RMSNorm GPU tests"
+     ),
+ )
+-TEST_TIMEOUT_SECONDS = float(
+-    os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
+-)
++TEST_TIMEOUT_SECONDS = float(os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300"))
+ 
+ 
+ def _free_port() -> int:
+@@ -145,10 +146,15 @@ def _run_eager(
+     rank: int,
+ ) -> None:
+     epsilon = 1e-6
+-    for dtype in (torch.float16, torch.bfloat16, torch.float32):
++    cases = [
++        (dtype, rows, hidden_size)
++        for dtype in (torch.float16, torch.bfloat16, torch.float32)
+         for rows, hidden_size in (
+             (1, 6144),
+             (1, 8192),
++            (2, 4096),
++            (4, 4096),
++            (8, 4096),
+             (2, 6144),
+             (3, 6144),
+             (4, 6144),
+@@ -156,40 +162,47 @@ def _run_eager(
+             (6, 6144),
+             (8, 6144),
+             (3, 128),
+-        ):
+-            if rows * hidden_size * dtype.itemsize > 128 * 1024:
+-                continue
+-            inp, residual, weight = _make_inputs(
+-                rows,
+-                hidden_size,
+-                dtype,
+-                device,
+-                rank,
+-            )
+-            expected_out, expected_residual = _reference(
+-                inp,
+-                residual,
+-                weight,
+-                epsilon,
+-            )
+-            torch.cuda.synchronize(device)
+-            wrong_device = (rank + 1) % dist.get_world_size()
+-            exercise_device_guard = dtype == torch.float16 and rows == 1 and hidden_size == 6144
+-            if exercise_device_guard:
+-                torch.cuda.set_device(wrong_device)
+-            out, residual_out = pool.all_reduce_fused_add_rms_norm(
+-                inp,
+-                residual,
+-                weight,
+-                epsilon,
+-                channel_id="eager:fused-rmsnorm",
+-            )
+-            if exercise_device_guard:
+-                assert torch.cuda.current_device() == wrong_device
+-                torch.cuda.set_device(rank)
+-            torch.cuda.synchronize(device)
+-            _assert_close(out, expected_out, dtype)
+-            _assert_close(residual_out, expected_residual, dtype)
++        )
++        if rows * hidden_size * dtype.itemsize <= 128 * 1024
++    ]
++    if os.getenv("B12X_PCIE_ONESHOT_RMS_TOPOLOGY_ONLY", "0") not in ("", "0"):
++        hidden_size = 4096 if dist.get_world_size() == 2 else 6144
++        cases = [(torch.bfloat16, rows, hidden_size) for rows in (1, 2, 4, 8)]
++
++    for dtype, rows, hidden_size in cases:
++        inp, residual, weight = _make_inputs(
++            rows,
++            hidden_size,
++            dtype,
++            device,
++            rank,
++        )
++        expected_out, expected_residual = _reference(
++            inp,
++            residual,
++            weight,
++            epsilon,
++        )
++        torch.cuda.synchronize(device)
++        wrong_device = (rank + 1) % dist.get_world_size()
++        exercise_device_guard = (
++            dtype == torch.float16 and rows == 1 and hidden_size == 6144
++        )
++        if exercise_device_guard:
++            torch.cuda.set_device(wrong_device)
++        out, residual_out = pool.all_reduce_fused_add_rms_norm(
++            inp,
++            residual,
++            weight,
++            epsilon,
++            channel_id="eager:fused-rmsnorm",
++        )
++        if exercise_device_guard:
++            assert torch.cuda.current_device() == wrong_device
++            torch.cuda.set_device(rank)
++        torch.cuda.synchronize(device)
++        _assert_close(out, expected_out, dtype)
++        _assert_close(residual_out, expected_residual, dtype)
+ 
+ 
+ def _run_graph(
+@@ -197,8 +210,8 @@ def _run_graph(
+     device: torch.device,
+     rank: int,
+ ) -> None:
+-    rows = 4
+-    hidden_size = 6144
++    rows = int(os.getenv("B12X_PCIE_ONESHOT_RMS_GRAPH_ROWS", "4"))
++    hidden_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_GRAPH_HIDDEN", "6144"))
+     epsilon = 1e-6
+     dtype = torch.bfloat16
+     inp, residual, weight = _make_inputs(
+@@ -227,10 +240,30 @@ def _run_graph(
+     # preserves the one-kernel production topology.
+     _cuda_graph_kernel_chain(graph)
+     stream = torch.cuda.current_stream(device)
++    world_size = dist.get_world_size()
++    topology_remote = (
++        (
++            world_size == 2
++            and os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
++        )
++        or (
++            world_size == 4
++            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
++        )
++        or (
++            world_size == 8
++            and os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
++        )
++    )
+     offset = 0
+-    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
+-        remote_source = (rank + 1) % dist.get_world_size()
+-        offset = remote_source * inp.numel() * inp.element_size()
++    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0") or topology_remote:
++        if world_size == 8 and topology_remote:
++            # TP8 owner mode publishes owner data into each rank's staging
++            # slot, so probe the island owner rather than a neighboring rank.
++            remote_source = 0 if rank < 4 else 4
++        else:
++            remote_source = (rank + 1) % world_size
++        offset = remote_source * channel.eager_buffer_bytes
+     snapshots = [_local_eager_words(channel, stream, offset=offset)]
+ 
+     for iteration in range(3):
+@@ -273,6 +306,87 @@ def _run_graph(
+     )
+ 
+ 
++def _run_tp8_graph_mode_transition(
++    pool: PCIeOneshotAllReducePool,
++    device: torch.device,
++    rank: int,
++) -> None:
++    """Replay C1 fallback followed by C4 owner reduction on one channel."""
++
++    if dist.get_world_size() != 8 or os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") in (
++        "",
++        "0",
++    ):
++        return
++
++    hidden_size = 6144
++    epsilon = 1e-6
++    dtype = torch.bfloat16
++    stream = torch.cuda.Stream(device=device)
++    channel_id = "graph:fused-transition"
++    channel = pool.for_stream(stream, channel_id=channel_id)
++
++    calls = []
++    modes = []
++    state = channel._ext._state(channel._ptr)
++    for rows, iteration in ((1, 41), (4, 43)):
++        inp, residual, weight = _make_inputs(
++            rows,
++            hidden_size,
++            dtype,
++            device,
++            rank,
++            iteration=iteration,
++        )
++        out = torch.empty_like(inp)
++        calls.append((inp, residual, weight, out))
++        modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
++        with torch.cuda.stream(stream):
++            channel.prepare_graph_fused_add_rms_norm(inp)
++    assert modes == ["stage_pull", "stage_tp8_owner"]
++
++    graph = torch.cuda.CUDAGraph(keep_graph=True)
++    with (
++        pool.capture(stream=stream, channel_id=channel_id),
++        torch.cuda.graph(graph, stream=stream),
++    ):
++        for inp, residual, weight, out in calls:
++            pool.all_reduce_fused_add_rms_norm(
++                inp,
++                residual,
++                weight,
++                epsilon,
++                out=out,
++                residual_out=residual,
++                stream=stream,
++                channel_id=channel_id,
++            )
++
++    for replay in range(3):
++        expected = []
++        for rows, (inp, residual, weight, _out) in zip((1, 4), calls, strict=True):
++            next_inp, next_residual, _ = _make_inputs(
++                rows,
++                hidden_size,
++                dtype,
++                device,
++                rank,
++                iteration=47 + replay,
++            )
++            inp.copy_(next_inp)
++            residual.copy_(next_residual)
++            expected.append(_reference(inp, residual, weight, epsilon))
++
++        graph.replay()
++        stream.synchronize()
++        for (_inp, residual, _weight, out), (
++            expected_out,
++            expected_residual,
++        ) in zip(calls, expected, strict=True):
++            _assert_close(out, expected_out, dtype)
++            _assert_close(residual, expected_residual, dtype)
++
++
+ def _worker(rank: int, world_size: int, port: int) -> None:
+     torch.cuda.set_device(rank)
+     device = torch.device(f"cuda:{rank}")
+@@ -291,11 +405,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+         max_concurrent_channels=2,
+     )
+     try:
+-        pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
++        pool.prepare_channels(
++            (
++                "eager:fused-rmsnorm",
++                "graph:fused-rmsnorm",
++                "graph:fused-transition",
++            )
++        )
+         pool.for_stream(channel_id="eager:fused-rmsnorm")
+         _run_eager(pool, device, rank)
+         dist.barrier()
+         _run_graph(pool, device, rank)
++        dist.barrier()
++        _run_tp8_graph_mode_transition(pool, device, rank)
+         torch.cuda.synchronize(device)
+     finally:
+         pool.close()
+diff --git a/tests/gemm/test_fp6_packed_b.py b/tests/gemm/test_fp6_packed_b.py
+index 466efd0c6ab52869b1f530defde2742d1c4aa801..231bb22792773d32b6fc1d19f52ecd0524c024f3 100644
+--- a/tests/gemm/test_fp6_packed_b.py
++++ b/tests/gemm/test_fp6_packed_b.py
+@@ -7,6 +7,8 @@ streaming format differs.
+ """
+ from __future__ import annotations
+ 
++import inspect
++
+ import pytest
+ import torch
+ 
+@@ -15,6 +17,18 @@ cuda_required = pytest.mark.skipif(
+ )
+ 
+ 
++def test_dense_gemm_preserves_fp6_api_contracts():
++    """Keep the FP6 caller and dense GEMM implementation contracts in sync."""
++    from b12x._lib.dense_gemm import DenseGemmKernel, dense_gemm
++
++    parameter = inspect.signature(dense_gemm).parameters["row_scale"]
++    assert parameter.default is None
++    kernel_parameter = inspect.signature(DenseGemmKernel).parameters[
++        "fused_quant_bf16"
++    ]
++    assert kernel_parameter.default is None
++
++
+ def _gemm_operands(m: int, n: int, k: int, source_format: str):
+     """Quantized operands for one case, mirroring ``dense_fp6_linear_expanded``."""
+     from b12x._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
+diff --git a/tests/gemm/test_trellis_linear.py b/tests/gemm/test_trellis_linear.py
+index 70ba4a82b7c4fb95c0f298d9e49fc6ce1b509f7a..58231212060ceee7a07db03429cbace71b5476e5 100644
+--- a/tests/gemm/test_trellis_linear.py
++++ b/tests/gemm/test_trellis_linear.py
+@@ -36,6 +36,7 @@ from b12x.moe._shared.kernels.trellis_w4a8_transform import (
+ from b12x.moe._shared.kernels.w4a16.kernel import (
+     _run_trellis_dense_hadamard128,
+     _trellis256_dense_launch_geometry,
++    _use_k6_mcg_small,
+ )
+ from b12x.moe._shared.kernels.w4a16.prepare import (
+     prepare_qsrt_pair_moe_weights,
+@@ -413,6 +414,39 @@ def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
+         _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
+ 
+ 
++@pytest.mark.parametrize(
++    ("capability", "expected"),
++    [
++        ((12, 0), True),
++        ((12, 1), False),
++        ((9, 0), False),
++    ],
++)
++def test_k6_small_m_dispatch_requires_compiled_target(
++    monkeypatch,
++    capability: tuple[int, int],
++    expected: bool,
++) -> None:
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_capability",
++        lambda _device: capability,
++    )
++
++    assert (
++        _use_k6_mcg_small(
++            device=torch.device("cuda"),
++            m=128,
++            trellis_bits=6,
++            trellis_codebook="mcg",
++            trellis_pair_kind=None,
++            compute_dtype=torch.float16,
++            external_hadamard_128=None,
++        )
++        is expected
++    )
++
++
+ @pytest.mark.parametrize(
+     ("size_m", "size_k", "size_n", "expected"),
+     [
+diff --git a/tests/moe/test_mixed_trellis_source_contract.py b/tests/moe/test_mixed_trellis_source_contract.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34372720e9520c47143b5118b807ce0bb9b3dd03
+--- /dev/null
++++ b/tests/moe/test_mixed_trellis_source_contract.py
+@@ -0,0 +1,107 @@
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
++    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
++    for node in tree.body:
++        if isinstance(node, ast.ClassDef) and node.name == class_name:
++            for member in node.body:
++                if isinstance(member, ast.FunctionDef) and member.name == method_name:
++                    return member
++    raise AssertionError(f"missing {class_name}.{method_name} in {path}")
++
++
++def test_mixed_trellis_call_tracks_shared_moe_body_abi() -> None:
++    kernel_path = ROOT / "b12x/moe/_shared/kernels/w4a16/kernel.py"
++    mixed_path = ROOT / "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py"
++    body = _method(kernel_path, "W4A16FusedMoeKernel", "_moe_body")
++    mixed = _method(mixed_path, "W4A16MixedTrellisKernel", "kernel")
++
++    calls = [
++        node
++        for node in ast.walk(mixed)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr == "_moe_body"
++    ]
++    assert len(calls) == 1
++    call = calls[0]
++    assert not call.keywords
++
++    parameters = [argument.arg for argument in body.args.args][1:]
++    arguments = [ast.unparse(argument) for argument in call.args]
++    assert len(arguments) == len(parameters)
++    bound = dict(zip(parameters, arguments, strict=True))
++
++    assert bound["fc1_trellis_lut_addr"] == "cutlass.Int64(0)"
++    assert bound["fc2_trellis_lut_addr"] == "cutlass.Int64(0)"
++    assert bound["weight_num_experts"] == "total_experts"
++    assert bound["route_num_experts"] == "total_experts"
++    assert bound["active_m"] == "active_m"
++    assert bound["fc1_emit_tile"] == "fc1_emit"
++    assert bound["fc2_emit_tile"] == "fc2_emit"
++
++
++def test_mixed_trellis_dispatch_tracks_tile_abis() -> None:
++    kernel_path = ROOT / "b12x/moe/_shared/kernels/w4a16/kernel.py"
++    mixed_path = ROOT / "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py"
++    dispatch = _method(mixed_path, "W4A16MixedTrellisKernel", "_dispatch_tier_gemm")
++
++    for method_name in ("_run_tile", "_run_tile_m8_pair"):
++        target = _method(kernel_path, "W4A16GemmKernel", method_name)
++        calls = [
++            node
++            for node in ast.walk(dispatch)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == method_name
++        ]
++        assert len(calls) == 1
++        parameters = [argument.arg for argument in target.args.args][1:]
++        arguments = [ast.unparse(argument) for argument in calls[0].args]
++        assert len(arguments) == len(parameters)
++        bound = dict(zip(parameters, arguments, strict=True))
++        assert bound["trellis_lut_addr"] == "trellis_lut_addr"
++        assert bound["active_size_m"] == "active_size_m"
++
++
++def test_w4a16_internal_calls_supply_required_arguments() -> None:
++    path = ROOT / "b12x/moe/_shared/kernels/w4a16/kernel.py"
++    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
++    kernel = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "W4A16GemmKernel"
++    )
++    methods = {
++        node.name: node for node in kernel.body if isinstance(node, ast.FunctionDef)
++    }
++
++    mismatches: list[str] = []
++    for caller in methods.values():
++        for call in ast.walk(caller):
++            if not (
++                isinstance(call, ast.Call)
++                and isinstance(call.func, ast.Attribute)
++                and isinstance(call.func.value, ast.Name)
++                and call.func.value.id == "self"
++                and call.func.attr in methods
++            ):
++                continue
++            callee = methods[call.func.attr]
++            maximum = len(callee.args.args) - 1
++            required = maximum - len(callee.args.defaults)
++            supplied = len(call.args) + len(call.keywords)
++            if not required <= supplied <= maximum:
++                mismatches.append(
++                    f"{caller.name}:{call.lineno} -> {callee.name}: "
++                    f"supplied={supplied}, required={required}, maximum={maximum}"
++                )
++
++    assert not mismatches, "\n".join(mismatches)
+diff --git a/tests/moe/test_w4a16_mixed_trellis.py b/tests/moe/test_w4a16_mixed_trellis.py
+index d31c34f295ac3660de59dd27ba10e2014d4e47a2..6bbca4d024433af864b5299d16b60eecbd3d9703 100644
+--- a/tests/moe/test_w4a16_mixed_trellis.py
++++ b/tests/moe/test_w4a16_mixed_trellis.py
+@@ -145,8 +145,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
+ 
+     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
+     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
+-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
++    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
+         "descriptor_map",
++        "cutlass.Int64(0)",
++        "cutlass.Int64(0)",
+         "total_experts",
+         "total_experts",
+         "smem_base",
+diff --git a/tests/moe/test_w4a16_route_pack_warmup.py b/tests/moe/test_w4a16_route_pack_warmup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c7288b314ebc2785418085ce323881960fe192e
+--- /dev/null
++++ b/tests/moe/test_w4a16_route_pack_warmup.py
+@@ -0,0 +1,54 @@
++import pytest
++
++from b12x.moe._shared.kernels.w4a16.host import (
++    route_pack_warmup_token_counts,
++)
++
++
++@pytest.mark.parametrize(
++    ("capacity", "expected"),
++    [
++        (1, (1,)),
++        (5, (1, 2, 3, 4, 5)),
++        (6, (1, 2, 3, 4, 5, 6)),
++        (32, (1, 2, 3, 4, 5, 8, 9, 16, 17, 32)),
++        (
++            3072,
++            (
++                1,
++                2,
++                3,
++                4,
++                5,
++                8,
++                9,
++                16,
++                17,
++                32,
++                33,
++                64,
++                65,
++                128,
++                129,
++                256,
++                257,
++                512,
++                513,
++                1024,
++                1025,
++                2048,
++                2049,
++                3072,
++            ),
++        ),
++    ],
++)
++def test_route_pack_warmup_covers_capacity_buckets(
++    capacity: int, expected: tuple[int, ...]
++) -> None:
++    assert route_pack_warmup_token_counts(capacity) == expected
++
++
++def test_route_pack_warmup_rejects_empty_capacity() -> None:
++    with pytest.raises(ValueError, match="capacity must be positive"):
++        route_pack_warmup_token_counts(0)

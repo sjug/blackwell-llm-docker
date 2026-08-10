@@ -1,0 +1,1636 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Clean vLLM+SparkInfer (formerly B12X) image for Blackwell on CUDA 13.2.
+#
+# Source stack:
+#   NVIDIA CUDA 13.2.1 cuDNN devel base
+#   Latest CUDA 13.2-compatible NVIDIA library overlays: cuBLAS 13.4.1, cuDNN 9.22
+#   PyTorch 2.12.0+cu132 from the official PyTorch wheel index
+#   Patched NCCL 2.30.4 from local-inference-lab/nccl-canonical
+#   FlashInfer from pinned upstream git
+#   SparkInfer from pinned git
+#   vLLM from pinned git
+#
+# Build:
+#   DOCKER_BUILDKIT=1 docker build \
+#     -f Dockerfile.vllm-b12x-cu132 \
+#     -t voipmonitor/vllm:vllm-b12x-cu132 .
+# =============================================================================
+
+ARG CUDA_VERSION=13.2.1
+ARG UBUNTU_VERSION=24.04
+ARG PYTHON_VERSION=3.12
+ARG CUBLAS_CUDA13_VERSION=13.4.1.2-1
+ARG CUDNN_CUDA13_VERSION=9.22.0.52-1
+ARG CUDA_COMPAT_13_2_VERSION=595.71.05-1ubuntu1
+ARG VLLM_B12X_CU132_SYSTEM_BASE_IMAGE=vllm-b12x-cu132-system-base-build
+ARG VLLM_B12X_CU132_BUILD_BASE_IMAGE=vllm-b12x-cu132-build-base-build
+
+ARG NCCL_REPO=https://github.com/local-inference-lab/nccl-canonical.git
+ARG NCCL_REF=canonical/cu132-nccl2304-amd-noxml
+ARG NCCL_COMMIT=dfab7c1ace32da250ba97757879429c341b7bcf9
+ARG NCCL_SONAME=libnccl.so.2.30.4
+
+ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
+ARG FLASHINFER_REF=refs/pull/3395/head
+ARG FLASHINFER_COMMIT=9035311e975a6aeb2d229f5162e999dfb7c9a733
+
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_REF=refs/pull/324/head
+ARG DEEPGEMM_COMMIT=
+
+ARG EXLLAMAV3_REPO=https://github.com/brandonmmusic-max/exllamav3.git
+ARG EXLLAMAV3_REF=a1-retile-sm120
+ARG EXLLAMAV3_COMMIT=704aefd743b390af4bd0fb429d1906f9b964c7d8
+
+ARG B12X_REPO=https://github.com/lukealonso/b12x.git
+ARG B12X_REF=refs/pull/11/head
+ARG B12X_COMMIT=c929144c7689668b07ca65af10ceadf1c745165d
+
+ARG VLLM_REPO=https://github.com/local-inference-lab/vllm.git
+ARG VLLM_REF=dev/black-benediction
+ARG VLLM_COMMIT=
+ARG VLLM_BUILD_VERSION=0.11.2.dev279+black.benediction.b12x.cu132
+ARG VLLM_PATCH_URL=
+ARG VLLM_PATCH_SHA256=
+ARG LAUNCHER_REPO=https://github.com/local-inference-lab/vllm.git
+ARG LAUNCHER_REF=dev/black-benediction
+ARG LAUNCHER_COMMIT=
+ARG VLLM_REQUIRED_LAUNCHERS=
+ARG INSTANTTENSOR_REPO=https://github.com/scitix/InstantTensor.git
+ARG INSTANTTENSOR_REF=main
+ARG INSTANTTENSOR_COMMIT=
+
+ARG LMCACHE_REPO=https://github.com/local-inference-lab/LMCache.git
+ARG LMCACHE_REF=release/v0.5.2-glm52-dcp-base
+ARG LMCACHE_COMMIT=9cebd405d0caf4bebe01d694b5a8bf4e3e354314
+ARG LMCACHE_PATCH_FILE=
+ARG LMCACHE_PATCH_SHA256=
+ARG LMCACHE_BUILD_VERSION=0.5.2+glm52dcp.3
+
+ARG XGRAMMAR_REPO=https://github.com/mlc-ai/xgrammar.git
+ARG XGRAMMAR_REF=v0.2.5
+ARG XGRAMMAR_COMMIT=2ea71da4ccb997a06928c9fb69b99f330da56697
+ARG XGRAMMAR_VERSION=0.2.5
+ARG XGRAMMAR_TRANSFORMERS5_COMPAT=1
+
+ARG CUTLASS_REPO=https://github.com/NVIDIA/cutlass.git
+ARG CUTLASS_REF=main
+ARG CUTLASS_COMMIT=982cb9e718bcd4d7ac546b1795702a08326dfe4b
+ARG CUTLASS_DSL_VERSION=4.5.3
+ARG TOKENSPEED_MLA_VERSION=0.1.2
+ARG TVM_FFI_VERSION=0.1.9
+
+ARG TRITON_KERNELS_REPO=https://github.com/triton-lang/triton.git
+ARG TRITON_KERNELS_REF=
+ARG TRITON_KERNELS_COMMIT=
+
+ARG MAX_JOBS=128
+ARG NVCC_THREADS=1
+ARG VLLM_MAX_JOBS=128
+ARG VLLM_NVCC_THREADS=1
+
+# CUDA target architectures. Defaults match the historical SM120 (RTX PRO 6000
+# Blackwell) x86_64 build. For GB10 / DGX Spark (SM121, aarch64) pass:
+#   TORCH_CUDA_ARCH_LIST_ARG=12.1a
+#   CMAKE_CUDA_ARCHITECTURES_ARG=121a
+#   FLASHINFER_CUDA_ARCH_LIST_ARG=12.1a
+#   PLAIN_CUDA_ARCH_LIST_ARG=12.1
+# FlashInfer builds a separate cubin per SM12x variant on purpose (it refuses
+# to run SM120 cubins on SM121), and its sm121 AOT modules are only enabled
+# when 12.1a is in the arch list — do not reuse 12.0f for a GB10 build.
+# PLAIN_CUDA_ARCH_LIST_ARG feeds the suffix-less LMCache wheel build; the
+# EXL3 extension inherits the suffixed TORCH_CUDA_ARCH_LIST from the base
+# stage ENV.
+ARG TORCH_CUDA_ARCH_LIST_ARG=12.0a
+ARG CMAKE_CUDA_ARCHITECTURES_ARG=120a
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG=12.0f
+ARG PLAIN_CUDA_ARCH_LIST_ARG=12.0
+
+# =============================================================================
+# Stage 0: patched NCCL
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS nccl-build
+
+ARG NCCL_REPO
+ARG NCCL_REF
+ARG NCCL_COMMIT
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+RUN for attempt in {1..5}; do \
+      if apt-get update; then break; fi; \
+      if [[ "${attempt}" == "5" ]]; then exit 1; fi; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep $((attempt * 10)); \
+    done \
+    && apt-get install -y --no-install-recommends \
+    git \
+    python3 \
+    build-essential \
+    make \
+    g++ \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN git clone "${NCCL_REPO}" nccl \
+ && cd nccl \
+ && git checkout "${NCCL_REF}" \
+ && if [[ -n "${NCCL_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${NCCL_COMMIT}" ]] || { echo "ERROR: NCCL_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${NCCL_COMMIT}" >&2; exit 1; }; fi \
+ && make -j"$(nproc)" src.build CUDA_HOME=/usr/local/cuda \
+ && strings "build/lib/libnccl.so.2.30.4" | grep -F "NCCL version 2.30.4 compiled with CUDA 13.2"
+
+# =============================================================================
+# Stage 1: reusable CUDA/Python/NCCL system base
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS vllm-b12x-cu132-system-base-build
+
+ARG PYTHON_VERSION
+ARG NCCL_SONAME
+ARG CUBLAS_CUDA13_VERSION
+ARG CUDNN_CUDA13_VERSION
+ARG CUDA_COMPAT_13_2_VERSION
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Keep the toolkit on 13.2.1, but overlay the latest CUDA 13 libraries NVIDIA
+# publishes for Ubuntu 24.04 without pulling CUDA 13.3 packages.
+RUN for attempt in {1..5}; do \
+      if apt-get update; then break; fi; \
+      if [[ "${attempt}" == "5" ]]; then exit 1; fi; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep $((attempt * 10)); \
+    done \
+    && apt-get install -y --allow-change-held-packages --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-venv \
+    python3-pip \
+    git \
+    git-lfs \
+    wget \
+    curl \
+    ca-certificates \
+    build-essential \
+    cmake \
+    ninja-build \
+    ccache \
+    libprotobuf-dev \
+    protobuf-compiler \
+    pkg-config \
+    patchelf \
+    libssl-dev \
+    libffi-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libgomp1 \
+    numactl \
+    libnuma-dev \
+    libibverbs-dev \
+    pciutils \
+    cuda-compat-13-2=${CUDA_COMPAT_13_2_VERSION} \
+    libcublas13-cuda-13=${CUBLAS_CUDA13_VERSION} \
+    libcublas13-dev-cuda-13=${CUBLAS_CUDA13_VERSION} \
+    cublas-cuda-13=${CUBLAS_CUDA13_VERSION} \
+    libcudnn9-cuda-13=${CUDNN_CUDA13_VERSION} \
+    libcudnn9-dev-cuda-13=${CUDNN_CUDA13_VERSION} \
+    libcudnn9-headers-cuda-13=${CUDNN_CUDA13_VERSION} \
+    libcudnn9-static-cuda-13=${CUDNN_CUDA13_VERSION} \
+    && ldconfig \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN multiarch="$(uname -m)-linux-gnu" \
+ && cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && cublas="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublas.so.13)" \
+ && cublas_lt="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublasLt.so.13)" \
+ && cublas_name="$(basename "${cublas}")" \
+ && cublas_lt_name="$(basename "${cublas_lt}")" \
+ && test -f "${cublas}" \
+ && test -f "${cublas_lt}" \
+ && for cuda_libdir in /usr/local/cuda/targets/${cuda_target}/lib /usr/local/cuda-${CUDA_VERSION}/targets/${cuda_target}/lib; do \
+      if [[ -d "${cuda_libdir}" ]]; then \
+        cuda_libdir="$(readlink -f "${cuda_libdir}")"; \
+        rm -f "${cuda_libdir}"/libcublas.so "${cuda_libdir}"/libcublas.so.13 "${cuda_libdir}"/libcublas.so.13.*; \
+        rm -f "${cuda_libdir}"/libcublasLt.so "${cuda_libdir}"/libcublasLt.so.13 "${cuda_libdir}"/libcublasLt.so.13.*; \
+        ln -s "${cublas}" "${cuda_libdir}/${cublas_name}"; \
+        ln -s "${cublas_name}" "${cuda_libdir}/libcublas.so.13"; \
+        ln -s libcublas.so.13 "${cuda_libdir}/libcublas.so"; \
+        ln -s "${cublas_lt}" "${cuda_libdir}/${cublas_lt_name}"; \
+        ln -s "${cublas_lt_name}" "${cuda_libdir}/libcublasLt.so.13"; \
+        ln -s libcublasLt.so.13 "${cuda_libdir}/libcublasLt.so"; \
+      fi; \
+    done \
+ && ldconfig
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+ && update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
+
+COPY --from=nccl-build /build/nccl/build/lib/${NCCL_SONAME} /opt/libnccl-local-inference.so.2.30.4
+
+ENV NCCL_LOCAL_INFERENCE_PATH=/opt/libnccl-local-inference.so.2.30.4 \
+    NCCL_PR2127_PATH=/opt/libnccl-local-inference.so.2.30.4 \
+    VLLM_NCCL_SO_PATH=/opt/libnccl-local-inference.so.2.30.4
+
+LABEL org.opencontainers.image.description="Reusable CUDA 13.2.1 vLLM+B12X system base with latest CUDA 13.2-compatible cuBLAS/cuDNN overlays and patched NCCL 2.30.4" \
+      local-inference.cuda.version="13.2.1" \
+      local-inference.cuda.compat.version="${CUDA_COMPAT_13_2_VERSION}" \
+      local-inference.cublas.version="${CUBLAS_CUDA13_VERSION}" \
+      local-inference.cudnn.version="${CUDNN_CUDA13_VERSION}" \
+      local-inference.nccl.repo="local-inference-lab/nccl-canonical" \
+      local-inference.nccl.branch="canonical/cu132-nccl2304-amd-noxml" \
+      local-inference.nccl.version="2.30.4"
+
+# =============================================================================
+# Stage 1b: reusable PyTorch/CUTLASS build base
+# =============================================================================
+FROM ${VLLM_B12X_CU132_SYSTEM_BASE_IMAGE} AS vllm-b12x-cu132-build-base-build
+
+ARG CUTLASS_DSL_VERSION
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+RUN python -m venv /opt/venv
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade "pip<26" setuptools wheel \
+ && python -m pip install \
+      --index-url https://download.pytorch.org/whl/cu132 \
+      --extra-index-url https://pypi.org/simple \
+      "torch==2.12.0+cu132" \
+      "torchvision==0.27.0+cu132" \
+ && python -m pip install \
+      "cuda-tile>=1.4.0" \
+      nvidia-cuda-tileiras==13.2.78 \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+ && python -m pip install --force-reinstall --no-deps \
+      "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}"
+
+# NVIDIA aarch64 wheels (e.g. nvidia-cusparselt-cu13) record the nonstandard
+# platform tag manylinux2014_sbsa in their dist-info WHEEL metadata; pip >= 25
+# treats that as "not supported on this platform" in pip check. Normalize the
+# tag (and its RECORD hash) to the real aarch64 tag. No-op on x86_64.
+RUN python - <<'FIXSBSA'
+import base64, csv, glob, hashlib, io, pathlib
+
+for wheel in glob.glob("/opt/venv/lib/python*/site-packages/*.dist-info/WHEEL"):
+    path = pathlib.Path(wheel)
+    text = path.read_text()
+    if "manylinux2014_sbsa" not in text:
+        continue
+    path.write_text(text.replace("manylinux2014_sbsa", "manylinux2014_aarch64"))
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    record_path = path.parent / "RECORD"
+    rows = list(csv.reader(io.StringIO(record_path.read_text())))
+    for row in rows:
+        if row and row[0].endswith(".dist-info/WHEEL"):
+            row[1] = f"sha256={digest}"
+            row[2] = str(len(data))
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(rows)
+    record_path.write_text(out.getvalue())
+    print(f"normalized sbsa platform tag: {wheel}")
+FIXSBSA
+
+RUN python -m pip check
+
+RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
+ && local_nccl=/opt/libnccl-local-inference.so.2.30.4 \
+ && normal_nccl=/opt/libnccl.so.2.30.4 \
+ && test -e "${torch_nccl}" \
+ && test -e "${local_nccl}" \
+ && if [[ ! -e "${normal_nccl}" ]]; then cp -aL "${local_nccl}" "${normal_nccl}"; fi \
+ && if [[ ! -e "${local_nccl}.orig" ]]; then cp -aL "${local_nccl}" "${local_nccl}.orig"; fi \
+ && if [[ ! -e "${torch_nccl}.torch-bundled-2.29.7" ]]; then cp -aL "${torch_nccl}" "${torch_nccl}.torch-bundled-2.29.7"; fi \
+ && readelf -d "${normal_nccl}" | grep -F 'Library soname: [libnccl.so.2]' \
+ && ln -sfn "${normal_nccl}" "${local_nccl}" \
+ && ln -sfn "${normal_nccl}" /opt/libnccl.so.2 \
+ && ln -sfn "${normal_nccl}" "${torch_nccl}" \
+ && ldconfig \
+ && python - <<'PY'
+import torch
+
+paths = []
+with open("/proc/self/maps", encoding="utf-8") as maps:
+    for line in maps:
+        if "libnccl" in line:
+            paths.append(line.split()[-1])
+
+unique = sorted(set(paths))
+print("torch nccl api", torch.cuda.nccl.version())
+print("mapped libnccl paths", unique)
+assert unique == ["/opt/libnccl.so.2.30.4"], unique
+PY
+
+RUN python - <<'PY'
+import torch
+print("torch", torch.__version__)
+print("torch cuda", torch.version.cuda)
+print("torch nccl", torch.cuda.nccl.version())
+assert torch.__version__.startswith("2.12.0+cu132")
+assert torch.version.cuda == "13.2"
+PY
+
+ARG TORCH_CUDA_ARCH_LIST_ARG
+ARG CMAKE_CUDA_ARCHITECTURES_ARG
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG
+
+ENV CCACHE_DIR=/root/.ccache \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST_ARG} \
+    CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES_ARG} \
+    FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST_ARG} \
+    FLASHINFER_LOCAL_VERSION=cu132 \
+    FLASHINFER_NVCC_THREADS=1 \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    AOT_MAX_JOBS_CAP=8
+
+LABEL org.opencontainers.image.description="Reusable CUDA 13.2.1 vLLM+B12X build base with PyTorch 2.12 cu132 and CUTLASS DSL" \
+      local-inference.torch.version="2.12.0+cu132" \
+      local-inference.cutlass_dsl.version="${CUTLASS_DSL_VERSION}"
+
+# =============================================================================
+# Stage 1c: build settings overlay
+# =============================================================================
+FROM ${VLLM_B12X_CU132_BUILD_BASE_IMAGE} AS base
+
+ARG MAX_JOBS
+ARG NVCC_THREADS
+ARG CUTLASS_DSL_VERSION
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ENV MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS}
+
+# The reusable build base remains pinned for old image recipes. Upgrade it in
+# this derived stage when a newer vLLM revision requires a newer CuTe DSL.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+ && python -m pip install --force-reinstall --no-deps \
+      "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+ && python -m pip check
+
+# CUDA 13.x headers can be laid out under cccl/. Keep both old and new include
+# paths usable for third-party build scripts.
+RUN cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && if [[ -d /usr/local/cuda/targets/${cuda_target}/include/cccl/cuda && ! -e /usr/local/cuda/include/cuda ]]; then \
+      ln -sf /usr/local/cuda/targets/${cuda_target}/include/cccl/cuda /usr/local/cuda/include/cuda; \
+    fi
+
+# =============================================================================
+# Stage 2a: build the public SM120 EXL3 extension against this image's exact
+# PyTorch/CUDA ABI. This avoids the opaque prebuilt binary and ABI shim used by
+# the original standalone EXL3 image.
+# =============================================================================
+FROM base AS exllamav3-build
+
+# Re-declare SHELL: the OCI image format does not persist it across stage
+# boundaries (podman/buildah), unlike docker-format BuildKit builds.
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG EXLLAMAV3_REPO
+ARG EXLLAMAV3_REF
+ARG EXLLAMAV3_COMMIT
+# EXLLAMAV3_PATCH_FILE carries the SM121/aarch64 arch-guard patch: pure x86
+# guards around the AVX target macros, cpuid detection, and AVX CPU-reduce
+# translation units (stubs behind the existing is_avx2_supported() runtime
+# gate). With the guards the full extension builds for sm_121a; the decode/
+# reconstruct/GEMM family is codebook-oracle-exact on GB10 (2026-08-08), so
+# serving pre-quantized EXL3 checkpoints is supported. The ENCODER fast path
+# is inconsistent with the decode codebook for 3INST/MCG on ALL platforms
+# (fork-wide; oracle-verified on SM120 and SM121) - online quantization is
+# fail-closed in the composed vLLM tree, not here.
+# SKIP_EXLLAMAV3=1 remains an escape hatch producing the SKIPPED marker.
+ARG SKIP_EXLLAMAV3=0
+ARG EXLLAMAV3_PATCH_FILE=
+ARG EXLLAMAV3_PATCH_SHA256=
+
+WORKDIR /build
+
+COPY patches /tmp/exllamav3-build-patches
+
+RUN if [[ "${SKIP_EXLLAMAV3}" == "1" ]]; then \
+      install -d /opt/exllamav3 /opt/exllamav3-python; \
+      printf 'exllamav3 %s (%s) deliberately not built (SKIP_EXLLAMAV3=1)\n' \
+        "${EXLLAMAV3_COMMIT}" "${EXLLAMAV3_REF}" > /opt/exllamav3/SKIPPED; \
+      cp /opt/exllamav3/SKIPPED /opt/exllamav3-python/SKIPPED; \
+    else \
+      git clone "${EXLLAMAV3_REPO}" exllamav3 \
+      && cd exllamav3 \
+      && git checkout "${EXLLAMAV3_REF}" \
+      && { [[ "$(git rev-parse HEAD)" = "${EXLLAMAV3_COMMIT}" ]] || { \
+           echo "ERROR: EXLLAMAV3_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${EXLLAMAV3_COMMIT}" >&2; \
+           exit 1; \
+         }; } \
+      && if [[ -n "${EXLLAMAV3_PATCH_FILE}" ]]; then \
+           echo "${EXLLAMAV3_PATCH_SHA256}  /tmp/exllamav3-build-patches/${EXLLAMAV3_PATCH_FILE}" | sha256sum -c -; \
+           git apply --verbose "/tmp/exllamav3-build-patches/${EXLLAMAV3_PATCH_FILE}"; \
+         fi \
+      && TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} MAX_JOBS="${MAX_JOBS}" \
+           python setup.py build_ext --inplace \
+      && mapfile -t extensions < <(find . -maxdepth 1 -type f -name 'exllamav3_ext*.so' -print) \
+      && [[ "${#extensions[@]}" == 1 ]] \
+      && install -d /opt/exllamav3 \
+      && install -m 0755 "${extensions[0]}" /opt/exllamav3/ \
+      && test -f exllamav3/modules/quant/exl3_lib/quantize.py \
+      && install -d /opt/exllamav3-python \
+      && cp -a exllamav3 /opt/exllamav3-python/; \
+    fi
+
+RUN if [[ "${SKIP_EXLLAMAV3}" == "1" ]]; then \
+      test -f /opt/exllamav3/SKIPPED; \
+      echo "EXL3 extension: SKIPPED"; \
+      exit 0; \
+    fi \
+ && VLLM_EXL3_EXT_PATH=/opt/exllamav3 python - <<'PY'
+import importlib
+import os
+import sys
+
+import torch  # Load the Torch runtime and libc10 before the extension.
+
+sys.path.insert(0, os.environ["VLLM_EXL3_EXT_PATH"])
+ext = importlib.import_module("exllamav3_ext")
+required = (
+    "exl3_gemm",
+    "exl3_moe_fused",
+    "exl3_moe_fused_retile",
+    "exl3_moe_max_concurrency",
+)
+missing = [name for name in required if not hasattr(ext, name)]
+assert not missing, f"EXL3 extension is missing exports: {missing}"
+print("EXL3 extension source build: PASS")
+PY
+
+# =============================================================================
+# Stage 2b: build FlashInfer and flashinfer-cubin.
+#
+# Keep this stage independent from vLLM args so local BuildKit cache reuses the
+# expensive FlashInfer/CUBIN build until CUDA/Torch/CUTLASS/FlashInfer changes.
+# =============================================================================
+FROM base AS flashinfer-build
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG FLASHINFER_REPO
+ARG FLASHINFER_REF
+ARG FLASHINFER_COMMIT
+ARG FLASHINFER_BUILD_CUBIN=1
+ARG CUTLASS_REPO
+ARG CUTLASS_REF
+ARG CUTLASS_COMMIT
+
+WORKDIR /build
+
+RUN if [[ "${CUTLASS_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+      git clone --filter=blob:none "${CUTLASS_REPO}" /build/cutlass; \
+      cd /build/cutlass; \
+      git checkout "${CUTLASS_REF}"; \
+    else \
+      git clone --depth 1 --branch "${CUTLASS_REF}" "${CUTLASS_REPO}" /build/cutlass; \
+      cd /build/cutlass; \
+    fi \
+ && if [[ -n "${CUTLASS_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${CUTLASS_COMMIT}" ]] || { echo "ERROR: CUTLASS_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${CUTLASS_COMMIT}" >&2; exit 1; }; fi \
+ && grep "CUTLASS_MAJOR\\|CUTLASS_MINOR\\|CUTLASS_PATCH" include/cutlass/version.h | head -3
+
+RUN CUTLASS_DSL="$(python -c 'import cutlass.utils.blockscaled_layout as m; print(m.__file__)')" \
+ && cp /build/cutlass/python/CuTeDSL/cutlass/utils/blockscaled_layout.py "${CUTLASS_DSL}" \
+ && python -c 'from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa; print("OK: sm120_make_smem_layout_sfa available")'
+
+# Pin build-stage tvm-ffi to the runtime version: downstream stages (the
+# XGrammar source build in particular) link native bindings against
+# whatever libtvm_ffi is present here, while the final stage installs
+# apache-tvm-ffi==TVM_FFI_VERSION. The upstream ">=0.1.6" floats to the
+# newest release, which produced xgrammar bindings importing
+# TVMFFIGetCustomAllocator (0.1.13 ABI) that the 0.1.10 runtime lacks.
+ARG TVM_FFI_VERSION
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install \
+      "apache-tvm-ffi==${TVM_FFI_VERSION}" \
+      "nvidia-cudnn-frontend>=1.13.0" \
+      packaging \
+      pynvml \
+      nvidia-ml-py \
+      requests \
+      numpy \
+      einops \
+      click \
+      tabulate \
+      tqdm
+
+COPY .tmp-flashinfer-wheels/ /tmp/prebuilt-flashinfer-wheels/
+
+RUN --mount=type=cache,target=/root/.ccache \
+    if compgen -G "/tmp/prebuilt-flashinfer-wheels/flashinfer_python-*.whl" >/dev/null; then \
+      ls -lh /tmp/prebuilt-flashinfer-wheels; \
+      (python -m pip uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache || true); \
+      shopt -s nullglob; \
+      wheels=(/tmp/prebuilt-flashinfer-wheels/flashinfer_python-*.whl \
+        /tmp/prebuilt-flashinfer-wheels/flashinfer_cubin-*.whl \
+        /tmp/prebuilt-flashinfer-wheels/flashinfer_jit_cache-*.whl); \
+      python -m pip install --no-deps --force-reinstall "${wheels[@]}"; \
+    else \
+      git clone --recursive "${FLASHINFER_REPO}" /tmp/flashinfer-src; \
+      cd /tmp/flashinfer-src; \
+      if [[ "${FLASHINFER_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+        git fetch --depth=1 origin "${FLASHINFER_REF}"; \
+        git checkout FETCH_HEAD; \
+      elif [[ "${FLASHINFER_REF}" == refs/* ]]; then \
+        git fetch origin "${FLASHINFER_REF}"; \
+        git checkout FETCH_HEAD; \
+      else \
+        git checkout "${FLASHINFER_REF}"; \
+      fi; \
+      if [[ -n "${FLASHINFER_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${FLASHINFER_COMMIT}" ]] || { echo "ERROR: FLASHINFER_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${FLASHINFER_COMMIT}" >&2; exit 1; }; fi; \
+      git submodule update --init --recursive; \
+      (python -m pip uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache || true); \
+      FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+        FLASHINFER_ENABLE_SM90=0 \
+        MAX_JOBS="${MAX_JOBS}" \
+        python -m pip install --no-build-isolation --no-deps -v .; \
+      if [[ "${FLASHINFER_BUILD_CUBIN}" == "1" ]] && FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+        MAX_JOBS="${MAX_JOBS}" \
+        python -m pip wheel --no-build-isolation --no-deps -w /tmp/flashinfer-wheels ./flashinfer-cubin; then \
+        python -m pip install --no-deps --force-reinstall /tmp/flashinfer-wheels/flashinfer_cubin-*.whl; \
+      else \
+        echo "WARNING: flashinfer-cubin wheel build skipped or failed; continuing with flashinfer-python + flashinfer-jit-cache"; \
+      fi; \
+      FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+        MAX_JOBS="${MAX_JOBS}" \
+        python -m pip wheel --no-build-isolation --no-deps -w /tmp/flashinfer-wheels ./flashinfer-jit-cache; \
+      python -m pip install --no-deps --force-reinstall /tmp/flashinfer-wheels/flashinfer_jit_cache-*.whl; \
+    fi \
+ && python -c 'import flashinfer; print("flashinfer", getattr(flashinfer, "__version__", "unknown"))'
+
+# =============================================================================
+# Stage 2b: build DeepGEMM on top of the cached FlashInfer stage.
+# =============================================================================
+FROM flashinfer-build AS deepgemm-build
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG DEEPGEMM_REPO
+ARG DEEPGEMM_REF
+ARG DEEPGEMM_COMMIT
+ARG DEEPGEMM_PATCH_FILE
+ARG DEEPGEMM_PATCH_SHA256
+
+COPY patches /tmp/deepgemm-build-patches
+
+RUN --mount=type=cache,target=/root/.ccache \
+    git clone --recursive "${DEEPGEMM_REPO}" /tmp/deepgemm-src \
+ && cd /tmp/deepgemm-src \
+ && if [[ "${DEEPGEMM_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+      git fetch --depth=1 origin "${DEEPGEMM_REF}"; \
+      git checkout FETCH_HEAD; \
+    elif [[ "${DEEPGEMM_REF}" == refs/* ]]; then \
+      git fetch origin "${DEEPGEMM_REF}"; \
+      git checkout FETCH_HEAD; \
+    else \
+      git checkout "${DEEPGEMM_REF}"; \
+    fi \
+ && if [[ -n "${DEEPGEMM_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${DEEPGEMM_COMMIT}" ]] || { echo "ERROR: DEEPGEMM_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${DEEPGEMM_COMMIT}" >&2; exit 1; }; fi \
+ && if [[ -n "${DEEPGEMM_PATCH_FILE}" ]]; then \
+      if [[ -n "${DEEPGEMM_PATCH_SHA256}" ]]; then \
+        echo "${DEEPGEMM_PATCH_SHA256}  /tmp/deepgemm-build-patches/${DEEPGEMM_PATCH_FILE}" | sha256sum -c -; \
+      fi; \
+      git apply --verbose "/tmp/deepgemm-build-patches/${DEEPGEMM_PATCH_FILE}" \
+      && git diff --check; \
+    fi \
+ && git submodule update --init --recursive \
+ && DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
+    python -m pip install --no-build-isolation --no-deps --force-reinstall . \
+ && cd / \
+ && python -c 'import importlib.metadata as md; import deep_gemm; print("deep_gemm", getattr(deep_gemm, "__version__", md.version("deep_gemm")))' \
+ && rm -rf /tmp/deepgemm-src /tmp/deepgemm-build-patches
+
+# =============================================================================
+# Stage 2c: build B12X on top of cached FlashInfer/DeepGEMM.
+# =============================================================================
+FROM deepgemm-build AS b12x-build
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG B12X_REPO
+ARG B12X_REF
+ARG B12X_COMMIT
+ARG B12X_PATCH_SHA256
+ARG B12X_PATCH_FILE
+ARG B12X_INTEGRATION_TREE
+
+COPY patches /tmp/build-patches
+
+RUN git clone --filter=blob:none "${B12X_REPO}" /tmp/b12x-src \
+ && cd /tmp/b12x-src \
+ && if [[ -n "${B12X_COMMIT}" ]]; then \
+      git fetch origin "${B12X_COMMIT}"; \
+      git checkout FETCH_HEAD; \
+    elif [[ "${B12X_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+      git fetch --depth=1 origin "${B12X_REF}"; \
+      git checkout FETCH_HEAD; \
+    elif [[ "${B12X_REF}" == refs/* ]]; then \
+      git fetch origin "${B12X_REF}"; \
+      git checkout FETCH_HEAD; \
+    else \
+      git checkout "${B12X_REF}"; \
+    fi \
+ && if [[ -n "${B12X_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${B12X_COMMIT}" ]] || { echo "ERROR: B12X_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${B12X_COMMIT}" >&2; exit 1; }; fi \
+ && if [[ -n "${B12X_PATCH_FILE}" ]]; then \
+      b12x_patch="/tmp/build-patches/${B12X_PATCH_FILE}"; \
+      [[ -f "${b12x_patch}" ]] || { echo "ERROR: B12X patch is missing: ${b12x_patch}" >&2; exit 1; }; \
+      if [[ -n "${B12X_PATCH_SHA256}" ]]; then \
+        echo "${B12X_PATCH_SHA256}  ${b12x_patch}" | sha256sum -c -; \
+      fi; \
+      git apply --verbose "${b12x_patch}"; \
+      git diff --check; \
+    fi \
+ && if [[ -n "${B12X_INTEGRATION_TREE}" ]]; then \
+      git add -A; \
+      actual_tree="$(git write-tree)"; \
+      [[ "${actual_tree}" == "${B12X_INTEGRATION_TREE}" ]] || { \
+        echo "ERROR: composed B12X/SparkInfer tree mismatch: ${actual_tree} != ${B12X_INTEGRATION_TREE}" >&2; \
+        exit 1; \
+      }; \
+    fi \
+ && python -m pip install --no-deps --force-reinstall . \
+ && rm -rf /tmp/b12x-src
+
+# Runtime CUDA sources are JIT-compiled from the installed package. Fail the
+# image build if a quoted local include was omitted from the wheel.
+RUN python - <<'PY'
+import re
+import site
+from pathlib import Path
+
+roots = [
+    Path(entry) / pkg / "comm" / "pcie"
+    for entry in site.getsitepackages()
+    for pkg in ("b12x", "sparkinfer")
+    if (Path(entry) / pkg / "comm" / "pcie").is_dir()
+]
+assert len(roots) == 1, roots
+include_re = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
+for source in roots[0].glob("*.cu"):
+    for include in include_re.findall(source.read_text(encoding="utf-8")):
+        dependency = source.parent / include
+        assert dependency.is_file(), f"{source.name} includes missing {include}"
+PY
+
+# =============================================================================
+# Stage 2d: build vLLM on top of cached FlashInfer/DeepGEMM/B12X.
+# =============================================================================
+FROM b12x-build AS vllm-build
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG VLLM_REPO
+ARG VLLM_REF
+ARG VLLM_COMMIT
+ARG VLLM_PATCH_URL
+ARG VLLM_PATCH_SHA256
+ARG VLLM_PATCH_FILE
+ARG VLLM_INTEGRATION_TREE
+ARG VLLM_BUILD_VERSION
+ARG LAUNCHER_REPO
+ARG LAUNCHER_REF
+ARG LAUNCHER_COMMIT
+ARG VLLM_REQUIRED_LAUNCHERS
+ARG VLLM_MAX_JOBS
+ARG VLLM_NVCC_THREADS
+ARG TRITON_KERNELS_REPO
+ARG TRITON_KERNELS_REF
+ARG TRITON_KERNELS_COMMIT
+ARG CUTLASS_DSL_VERSION
+ARG XGRAMMAR_REPO
+ARG XGRAMMAR_REF
+ARG XGRAMMAR_COMMIT
+ARG XGRAMMAR_VERSION
+ARG XGRAMMAR_TRANSFORMERS5_COMPAT
+
+COPY tests/verify_xgrammar_required_tools.py /tmp/build-tests/verify_xgrammar_required_tools.py
+
+WORKDIR /build
+
+RUN git clone --recursive --filter=blob:none "${VLLM_REPO}" /opt/vllm \
+ && cd /opt/vllm \
+ && if [[ -n "${VLLM_COMMIT}" ]]; then \
+      git fetch origin "${VLLM_COMMIT}"; \
+      git checkout FETCH_HEAD; \
+    else \
+      git checkout "${VLLM_REF}"; \
+    fi \
+ && if [[ -n "${VLLM_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${VLLM_COMMIT}" ]] || { echo "ERROR: VLLM_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${VLLM_COMMIT}" >&2; exit 1; }; fi \
+ && if [[ -n "${VLLM_PATCH_FILE}" ]]; then \
+      vllm_patch="/tmp/build-patches/${VLLM_PATCH_FILE}"; \
+      [[ -f "${vllm_patch}" ]] || { echo "ERROR: vLLM patch is missing: ${vllm_patch}" >&2; exit 1; }; \
+      if [[ -n "${VLLM_PATCH_SHA256}" ]]; then \
+        echo "${VLLM_PATCH_SHA256}  ${vllm_patch}" | sha256sum -c -; \
+      fi; \
+      git apply --verbose "${vllm_patch}"; \
+      git diff --check; \
+    fi \
+ && if [[ -n "${VLLM_PATCH_URL}" ]]; then \
+      curl -fsSL "${VLLM_PATCH_URL}" -o /tmp/vllm-extra.patch; \
+      if [[ -n "${VLLM_PATCH_SHA256}" ]]; then \
+        echo "${VLLM_PATCH_SHA256}  /tmp/vllm-extra.patch" | sha256sum -c -; \
+      fi; \
+      git apply --verbose /tmp/vllm-extra.patch; \
+      git diff --check; \
+    fi \
+ && if [[ -n "${VLLM_INTEGRATION_TREE}" ]]; then \
+      git add -A; \
+      actual_tree="$(git write-tree)"; \
+      [[ "${actual_tree}" == "${VLLM_INTEGRATION_TREE}" ]] || { \
+        echo "ERROR: composed vLLM tree mismatch: ${actual_tree} != ${VLLM_INTEGRATION_TREE}" >&2; \
+        exit 1; \
+      }; \
+    fi \
+ && CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" python - <<'PY'
+import os
+import re
+from importlib.metadata import PackageNotFoundError, version
+
+path = "requirements/cuda.txt"
+text = open(path, encoding="utf-8").read()
+versions = {}
+for package in ("flashinfer-python", "flashinfer-cubin"):
+    try:
+        versions[package] = version(package)
+    except PackageNotFoundError:
+        text, count = re.subn(
+            rf"^{re.escape(package)}==.*\n?",
+            "",
+            text,
+            flags=re.MULTILINE,
+        )
+        if count:
+            print(f"removed absent {package} pin from {path}")
+        continue
+for package, package_version in versions.items():
+    text, count = re.subn(
+        rf"^{re.escape(package)}==.*$",
+        f"{package}=={package_version}",
+        text,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise SystemExit(
+            f"expected exactly one {package} pin in {path}, found {count}")
+cutlass_dsl_version = os.environ["CUTLASS_DSL_VERSION"]
+text, count = re.subn(
+    r"^nvidia-cutlass-dsl\[cu13\]==.*$",
+    f"nvidia-cutlass-dsl[cu13]=={cutlass_dsl_version}",
+    text,
+    flags=re.MULTILINE,
+)
+if count != 1:
+    raise SystemExit(
+        f"expected exactly one nvidia-cutlass-dsl pin in {path}, found {count}")
+open(path, "w", encoding="utf-8").write(text)
+print("vLLM FlashInfer requirements:", versions)
+print("vLLM CUTLASS DSL requirement:", cutlass_dsl_version)
+PY
+
+RUN cd /opt/vllm \
+ && grep -v '^torch==' requirements/build/cuda.txt > /tmp/vllm-build-notorch.txt \
+ && python -m pip install -r /tmp/vllm-build-notorch.txt \
+ && python -m pip install -r requirements/common.txt \
+ && python -m pip install "fastapi[standard]>=0.115.0,<0.137" \
+ && python -m pip install setuptools_scm "setuptools-rust>=1.9.0" \
+ && (python -m pip check || true)
+
+RUN <<'SH'
+set -euxo pipefail
+if [[ -z "${XGRAMMAR_REF}" ]]; then
+  echo "Using the xgrammar version supplied by vLLM requirements"
+  exit 0
+fi
+[[ -n "${XGRAMMAR_COMMIT}" ]]
+[[ -n "${XGRAMMAR_VERSION}" ]]
+git clone --filter=blob:none "${XGRAMMAR_REPO}" /tmp/xgrammar-src
+cd /tmp/xgrammar-src
+if [[ "${XGRAMMAR_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+  git fetch --depth=1 origin "${XGRAMMAR_REF}"
+  git checkout FETCH_HEAD
+elif [[ "${XGRAMMAR_REF}" == refs/* ]]; then
+  git fetch origin "${XGRAMMAR_REF}"
+  git checkout FETCH_HEAD
+else
+  git checkout "${XGRAMMAR_REF}"
+fi
+actual_commit="$(git rev-parse HEAD)"
+[[ "${actual_commit}" == "${XGRAMMAR_COMMIT}" ]] || {
+  echo "ERROR: XGRAMMAR_COMMIT mismatch: HEAD=${actual_commit} expected=${XGRAMMAR_COMMIT}" >&2
+  exit 1
+}
+git submodule update --init --recursive
+if [[ "${XGRAMMAR_TRANSFORMERS5_COMPAT}" == "1" ]]; then
+  # Upstream caps Transformers below 5 because several unrelated tokenizers
+  # regress there. This GLM-only image validates its tokenizer against the
+  # image's Transformers 5 runtime, so only relax that package-metadata cap.
+  python - <<'PY'
+from pathlib import Path
+
+path = Path("pyproject.toml")
+text = path.read_text()
+needle = '  "transformers>=4.38.0,<5",'
+replacement = '  "transformers>=4.38.0",'
+assert text.count(needle) == 1, "unexpected xgrammar Transformers requirement"
+path.write_text(text.replace(needle, replacement))
+PY
+elif [[ "${XGRAMMAR_TRANSFORMERS5_COMPAT}" != "0" ]]; then
+  echo "ERROR: XGRAMMAR_TRANSFORMERS5_COMPAT must be 0 or 1" >&2
+  exit 1
+fi
+python -m pip install --no-cache-dir "scikit-build-core>=0.10.0"
+mkdir -p /tmp/xgrammar-wheels
+SKBUILD_BUILD_DIR=/tmp/xgrammar-build \
+  CMAKE_BUILD_PARALLEL_LEVEL="${VLLM_MAX_JOBS}" \
+  python -m pip wheel --no-build-isolation --no-deps \
+    -w /tmp/xgrammar-wheels /tmp/xgrammar-src
+test "$(find /tmp/xgrammar-wheels -maxdepth 1 -name 'xgrammar-*.whl' | wc -l)" -eq 1
+python -m pip install --no-deps --force-reinstall \
+  /tmp/xgrammar-wheels/xgrammar-*.whl
+printf '%s\n' "${XGRAMMAR_VERSION}" > /opt/venv/.xgrammar-version
+python /tmp/build-tests/verify_xgrammar_required_tools.py \
+  --expected-version "${XGRAMMAR_VERSION}"
+SH
+
+WORKDIR /opt/vllm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libprotobuf-dev protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+ && . /root/.cargo/env \
+ && rust_toolchain="$(grep '^channel' rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')" \
+ && rustup toolchain install "${rust_toolchain}" \
+ && rustup default "${rust_toolchain}" \
+ && cargo --version \
+ && rustc --version
+
+RUN if [[ -f use_existing_torch.py ]]; then python use_existing_torch.py; fi
+
+RUN if [[ -n "${TRITON_KERNELS_REF}" ]]; then \
+      git clone --filter=blob:none "${TRITON_KERNELS_REPO}" /build/triton; \
+      cd /build/triton; \
+      git checkout "${TRITON_KERNELS_REF}"; \
+      if [[ -n "${TRITON_KERNELS_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${TRITON_KERNELS_COMMIT}" ]] || { echo "ERROR: TRITON_KERNELS_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${TRITON_KERNELS_COMMIT}" >&2; exit 1; }; fi; \
+      test -d /build/triton/python/triton_kernels/triton_kernels; \
+    fi
+
+RUN --mount=type=cache,target=/root/.ccache \
+    export VLLM_VERSION_OVERRIDE="${VLLM_BUILD_VERSION}"; \
+    export VLLM_TARGET_DEVICE=cuda; \
+    export VLLM_USE_PRECOMPILED=0; \
+    export VLLM_REQUIRE_RUST_FRONTEND=1; \
+    export PATH="/root/.cargo/bin:${PATH}"; \
+    export VLLM_CUTLASS_SRC_DIR=/build/cutlass; \
+    export MAX_JOBS="${VLLM_MAX_JOBS}"; \
+    export CMAKE_BUILD_PARALLEL_LEVEL="${VLLM_MAX_JOBS}"; \
+    export NVCC_THREADS="${VLLM_NVCC_THREADS}"; \
+    if [[ -n "${TRITON_KERNELS_REF}" ]]; then \
+      export TRITON_KERNELS_SRC_DIR=/build/triton/python/triton_kernels/triton_kernels; \
+    fi; \
+    python -m pip install setuptools_scm "setuptools-rust>=1.9.0"; \
+    python -m pip install --no-build-isolation --no-deps --force-reinstall . \
+ && python tools/build_rust.py --release \
+ && test -f vllm/_rust_tool_parser.abi3.so \
+ && test -x vllm/vllm-rs \
+ && site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+ && install -m 0755 vllm/_rust_tool_parser.abi3.so "${site_packages}/vllm/_rust_tool_parser.abi3.so" \
+ && install -m 0755 vllm/vllm-rs "${site_packages}/vllm/vllm-rs" \
+ && if [[ -d "${site_packages}/vllm/third_party/triton_kernels" && ! -e "${site_packages}/triton_kernels" ]]; then \
+      ln -s vllm/third_party/triton_kernels "${site_packages}/triton_kernels"; \
+    fi \
+ && for so in \
+      /opt/venv/lib/python3.12/site-packages/vllm/_C.abi3.so \
+      /opt/venv/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so \
+      /opt/venv/lib/python3.12/site-packages/vllm/cumem_allocator.abi3.so; do \
+      if [[ -f "${so}" ]] && ! readelf -d "${so}" | grep -Fq 'libcuda.so.1'; then \
+        patchelf --add-needed libcuda.so.1 "${so}"; \
+      fi; \
+    done \
+ && TRITON_KERNELS_REF="${TRITON_KERNELS_REF}" python - <<'PY'
+import importlib
+import importlib.util
+import os
+import torch, flashinfer, vllm
+print("torch", torch.__version__, torch.version.cuda)
+print("flashinfer", getattr(flashinfer, "__version__", "unknown"))
+print("vllm", getattr(vllm, "__version__", "unknown"))
+spec = importlib.util.find_spec("vllm._rust_tool_parser")
+assert spec is not None, "vllm._rust_tool_parser missing"
+print("rust_tool_parser", spec.origin)
+if os.environ.get("TRITON_KERNELS_REF"):
+    importlib.import_module("vllm.third_party.triton_kernels.matmul_ogs")
+PY
+
+COPY launchers/ /tmp/build-launchers/
+
+RUN launcher_root=/opt/vllm \
+ && if [[ ! -f "${launcher_root}/scripts/run-glm51-vllm" && ! -f "${launcher_root}/serve-glm51.sh" ]]; then \
+      git clone --filter=blob:none "${LAUNCHER_REPO}" /tmp/vllm-launchers; \
+      cd /tmp/vllm-launchers; \
+      git checkout "${LAUNCHER_REF}"; \
+      if [[ -n "${LAUNCHER_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${LAUNCHER_COMMIT}" ]] || { echo "ERROR: LAUNCHER_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${LAUNCHER_COMMIT}" >&2; exit 1; }; fi; \
+      launcher_root=/tmp/vllm-launchers; \
+      cd /opt/vllm; \
+    fi \
+ && for script in "${launcher_root}"/serve-*.sh; do \
+      if [[ -f "${script}" ]]; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
+    done \
+ && for script in /tmp/build-launchers/serve-*.sh; do \
+      if [[ -f "${script}" ]]; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
+    done \
+ && for script in /tmp/build-launchers/glm52-*.sh; do \
+      if [[ -f "${script}" ]]; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
+    done \
+ && if [[ -f /tmp/build-launchers/glm52-pcie-calibration.py ]]; then \
+       install -m 0755 /tmp/build-launchers/glm52-pcie-calibration.py /usr/local/bin/glm52-pcie-calibration.py; \
+     fi \
+ && if [[ -f "${launcher_root}/scripts/run-glm51-vllm" ]]; then \
+      install -m 0755 "${launcher_root}/scripts/run-glm51-vllm" /usr/local/bin/run-glm51-vllm; \
+    elif [[ -f /usr/local/bin/serve-glm51.sh ]]; then \
+      cp /usr/local/bin/serve-glm51.sh /usr/local/bin/run-glm51-vllm; \
+      chmod 0755 /usr/local/bin/run-glm51-vllm; \
+    else \
+      printf '%s\n' '#!/usr/bin/env bash' 'echo "GLM launcher is not available in this vLLM ref" >&2' 'exit 2' > /usr/local/bin/run-glm51-vllm; \
+      chmod 0755 /usr/local/bin/run-glm51-vllm; \
+    fi \
+ && if [[ -f "${launcher_root}/scripts/run-kimi26-vllm" ]]; then \
+      install -m 0755 "${launcher_root}/scripts/run-kimi26-vllm" /usr/local/bin/run-kimi26-vllm; \
+    elif [[ -f /usr/local/bin/serve-kimi26.sh ]]; then \
+      cp /usr/local/bin/serve-kimi26.sh /usr/local/bin/run-kimi26-vllm; \
+      chmod 0755 /usr/local/bin/run-kimi26-vllm; \
+    else \
+      printf '%s\n' '#!/usr/bin/env bash' 'echo "Kimi launcher is not available in this vLLM ref" >&2' 'exit 2' > /usr/local/bin/run-kimi26-vllm; \
+      chmod 0755 /usr/local/bin/run-kimi26-vllm; \
+    fi \
+ && for required_launcher in ${VLLM_REQUIRED_LAUNCHERS}; do \
+      test -x "/usr/local/bin/${required_launcher}" || { \
+        echo "ERROR: required launcher ${required_launcher} was not installed" >&2; \
+        exit 1; \
+      }; \
+    done \
+ && bash -n /usr/local/bin/run-glm51-vllm \
+ && bash -n /usr/local/bin/run-kimi26-vllm \
+ && for script in /usr/local/bin/serve-*.sh; do \
+      if [[ -f "${script}" ]]; then bash -n "${script}"; fi; \
+    done
+
+RUN <<'SH' bash -eux
+cat > /usr/local/bin/verify-vllm-b12x-cu132 <<'VERIFY'
+#!/usr/bin/env bash
+set -euo pipefail
+root="${1:-/opt/vllm}"
+test -d "${root}/vllm"
+test -x /usr/local/bin/run-glm51-vllm
+test -x /usr/local/bin/run-kimi26-vllm
+bash -n /usr/local/bin/run-glm51-vllm
+bash -n /usr/local/bin/run-kimi26-vllm
+for script in /usr/local/bin/serve-*.sh; do
+  if [[ -f "${script}" ]]; then bash -n "${script}"; fi
+done
+python - <<'PY'
+import importlib.metadata as md
+import importlib.util
+from pathlib import Path
+import torch
+import flashinfer
+import deep_gemm
+import vllm
+
+assert torch.__version__.startswith("2.12.0+cu132"), torch.__version__
+assert torch.version.cuda == "13.2", torch.version.cuda
+print("torch", torch.__version__, torch.version.cuda)
+print("torch nccl", torch.cuda.nccl.version())
+print("flashinfer", getattr(flashinfer, "__version__", "unknown"))
+print("deep_gemm", getattr(deep_gemm, "__version__", md.version("deep_gemm")))
+print("vllm", getattr(vllm, "__version__", "unknown"))
+print("xgrammar", md.version("xgrammar"))
+xgrammar_version_file = Path("/opt/venv/.xgrammar-version")
+if xgrammar_version_file.is_file():
+    expected_xgrammar = xgrammar_version_file.read_text().strip()
+    assert md.version("xgrammar") == expected_xgrammar
+kernel_package = "b12x" if importlib.util.find_spec("b12x") else "sparkinfer"
+print(kernel_package, md.version(kernel_package))
+spec = importlib.util.find_spec("vllm._rust_tool_parser")
+assert spec is not None, "vllm._rust_tool_parser missing"
+print("rust_tool_parser", spec.origin)
+PY
+VERIFY
+chmod 0755 /usr/local/bin/verify-vllm-b12x-cu132
+/usr/local/bin/verify-vllm-b12x-cu132 /opt/vllm
+SH
+
+RUN python -m pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+ && python -m pip cache purge || true \
+ && rm -rf /tmp/flashinfer-src /tmp/flashinfer-wheels /root/.cache/pip /tmp/pip-* \
+ && rm -rf /tmp/vllm-launchers \
+ && rm -rf /tmp/build-launchers \
+ && rm -rf \
+      /opt/vllm/.deps \
+      /opt/vllm/.git \
+      /opt/vllm/.github \
+      /opt/vllm/.buildkite \
+      /opt/vllm/build \
+      /opt/vllm/docs \
+      /opt/vllm/examples \
+      /opt/vllm/tests \
+      /tmp/deepgemm-src \
+ && find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true \
+ && find /opt/venv -name "*.pyc" -delete 2>/dev/null || true \
+ && find /opt/venv -name "*.a" -delete 2>/dev/null || true
+
+# =============================================================================
+# Stage 3: LMCache 0.5.2 with GLM-5.2 MLA+DCP support
+# =============================================================================
+FROM vllm-build AS lmcache-build
+
+# Re-declare SHELL: the OCI image format does not persist it across stage
+# boundaries (podman/buildah), unlike docker-format BuildKit builds.
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG LMCACHE_REPO
+ARG LMCACHE_REF
+ARG LMCACHE_COMMIT
+ARG LMCACHE_PATCH_FILE
+ARG LMCACHE_PATCH_SHA256
+ARG LMCACHE_BUILD_VERSION
+ARG LMCACHE_INTEGRATION_TREE
+ARG MAX_JOBS
+ARG PLAIN_CUDA_ARCH_LIST_ARG
+
+COPY patches/ /tmp/build-patches/
+
+RUN git clone --filter=blob:none "${LMCACHE_REPO}" /tmp/lmcache-src \
+ && cd /tmp/lmcache-src \
+ && if [[ -n "${LMCACHE_COMMIT}" ]]; then \
+      git fetch origin "${LMCACHE_COMMIT}"; \
+      git checkout FETCH_HEAD; \
+    else \
+      git checkout "${LMCACHE_REF}"; \
+    fi \
+ && if [[ -n "${LMCACHE_COMMIT}" ]]; then \
+      actual_commit="$(git rev-parse HEAD)"; \
+      [[ "${actual_commit}" = "${LMCACHE_COMMIT}" ]] || { \
+        echo "ERROR: LMCACHE_COMMIT mismatch: HEAD=${actual_commit} expected=${LMCACHE_COMMIT}" >&2; \
+        exit 1; \
+      }; \
+    fi \
+ && if [[ -n "${LMCACHE_PATCH_FILE}" ]]; then \
+      patch_path="/tmp/build-patches/${LMCACHE_PATCH_FILE}"; \
+      actual_patch_sha256="$(sha256sum "${patch_path}" | cut -d' ' -f1)"; \
+      [[ "${actual_patch_sha256}" = "${LMCACHE_PATCH_SHA256}" ]] || { \
+        echo "ERROR: LMCACHE_PATCH_SHA256 mismatch: actual=${actual_patch_sha256} expected=${LMCACHE_PATCH_SHA256}" >&2; \
+        exit 1; \
+      }; \
+      git apply --check "${patch_path}"; \
+      git apply "${patch_path}"; \
+    fi \
+ && git diff --check \
+ && if [[ -n "${LMCACHE_INTEGRATION_TREE}" ]]; then \
+      git add -A; \
+      actual_tree="$(git write-tree)"; \
+      [[ "${actual_tree}" == "${LMCACHE_INTEGRATION_TREE}" ]] || { \
+        echo "ERROR: composed LMCache tree mismatch: ${actual_tree} != ${LMCACHE_INTEGRATION_TREE}" >&2; \
+        exit 1; \
+      }; \
+    fi \
+ && python -m pip install \
+      pytest==8.4.1 \
+      sortedcontainers==2.4.0 \
+      aiofile==3.11.1 \
+      aiofiles==25.1.0 \
+      redis==8.0.1 \
+      numba==0.65.0 \
+      opentelemetry-exporter-prometheus==0.65b0 \
+ && mkdir -p /tmp/lmcache-wheels \
+ && BUILD_WITH_CUDA=1 \
+      TORCH_CUDA_ARCH_LIST=${PLAIN_CUDA_ARCH_LIST_ARG} \
+      MAX_JOBS="${MAX_JOBS}" \
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="${LMCACHE_BUILD_VERSION}" \
+      python -m pip wheel --no-build-isolation --no-deps \
+      -w /tmp/lmcache-wheels /tmp/lmcache-src \
+ && test "$(find /tmp/lmcache-wheels -maxdepth 1 -name 'lmcache-*.whl' | wc -l)" -eq 1 \
+ && python -m pip install --no-deps --force-reinstall \
+      /tmp/lmcache-wheels/lmcache-*.whl \
+ && mkdir -p /tmp/lmcache-test-support \
+ && ln -s /tmp/lmcache-src/tests /tmp/lmcache-test-support/tests \
+ && cd /tmp \
+ && PYTHONPATH=/tmp/lmcache-test-support \
+      python -m pytest --import-mode=importlib \
+      --confcutdir=/tmp/lmcache-src/tests/v1 \
+      /tmp/lmcache-src/tests/v1/distributed/test_fs_native_startup_scan.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_l1_manager.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_l1_manager_partial_alloc.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_l1_write_back_eviction.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_native_connector_l2_adapter.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_native_connector_restart_accounting.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_native_fs_connector_results.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_native_fs_key_compatibility.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_native_fs_odirect.py \
+      /tmp/lmcache-src/tests/v1/distributed/test_prefetch_controller.py \
+      /tmp/lmcache-src/tests/v1/multiprocess/test_futures.py \
+      /tmp/lmcache-src/tests/v1/multiprocess/test_mq.py \
+      /tmp/lmcache-src/tests/v1/multiprocess/test_mq_handler_helpers.py \
+      /tmp/lmcache-src/tests/v1/test_vllm_dcp_parallel_strategy.py \
+      /tmp/lmcache-src/tests/v1/test_vllm_mp_adapter.py \
+      /tmp/lmcache-src/tests/v1/test_vllm_mp_connector_metadata.py -q
+
+# =============================================================================
+# Stage 4: clean final runtime
+# =============================================================================
+FROM ${VLLM_B12X_CU132_SYSTEM_BASE_IMAGE} AS final
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+COPY --from=vllm-build /opt/venv /opt/venv
+COPY --from=vllm-build /opt/vllm /opt/vllm
+COPY --from=vllm-build /usr/local/bin/run-glm51-vllm /usr/local/bin/run-glm51-vllm
+COPY --from=vllm-build /usr/local/bin/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
+COPY --from=vllm-build /usr/local/bin/serve-*.sh /usr/local/bin/
+COPY --from=vllm-build /usr/local/bin/glm52-*.sh /usr/local/bin/
+COPY --from=vllm-build /usr/local/bin/glm52-pcie-calibration.py /usr/local/bin/glm52-pcie-calibration.py
+COPY --from=vllm-build /usr/local/bin/verify-vllm-b12x-cu132 /usr/local/bin/verify-vllm-b12x-cu132
+COPY --from=exllamav3-build /opt/exllamav3 /opt/exllamav3
+COPY --from=exllamav3-build /opt/exllamav3-python /opt/exllamav3-python
+ARG HUMMING_KERNELS_SPEC="humming-kernels[cu13]==0.1.4"
+ARG VLLM_RUNTIME_EXTRA_PACKAGES=""
+ARG INSTANTTENSOR_REPO
+ARG INSTANTTENSOR_REF
+ARG INSTANTTENSOR_COMMIT
+ARG CUTLASS_DSL_VERSION
+ARG TOKENSPEED_MLA_VERSION
+ARG TVM_FFI_VERSION
+ARG LMCACHE_BUILD_VERSION
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    printf '%s\n' \
+      'torch==2.12.0+cu132' \
+      'torchvision==0.27.0+cu132' \
+      'cuda-bindings==13.2.0' \
+      'cuda-python==13.2.0' \
+      'nvidia-cuda-cccl==13.2.75' \
+      'nvidia-cuda-crt==13.2.78' \
+      'nvidia-cuda-nvcc==13.2.78' \
+      'nvidia-cuda-tileiras==13.2.78' \
+      'nvidia-nvjitlink==13.2.78' \
+      'nvidia-nvvm==13.2.78' \
+      "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+      "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}" \
+      "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+      > /tmp/torch-cu132-constraints.txt \
+ && /opt/venv/bin/python -m pip install --upgrade \
+      --index-url https://download.pytorch.org/whl/cu132 \
+      --extra-index-url https://pypi.org/simple \
+      --constraint /tmp/torch-cu132-constraints.txt \
+      "cuda-bindings==13.2.0" \
+      "cuda-python==13.2.0" \
+      "numba==0.65.0" \
+      "quack-kernels>=0.3.3" \
+      "${HUMMING_KERNELS_SPEC}" \
+      "nvidia-cuda-tileiras==13.2.78" \
+      "nvidia-nvjitlink==13.2.78" \
+      "cuda-tile>=1.4.0" \
+      "tilelang==0.1.9" \
+      "tokenspeed-mla==${TOKENSPEED_MLA_VERSION}" \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+      "transformers>=5.5.1" \
+      "apache-tvm-ffi==${TVM_FFI_VERSION}" \
+      "fastsafetensors>=0.3.2" \
+      "pytest==8.4.1" \
+      "tblib==3.2.2" \
+ && if [[ -n "${VLLM_RUNTIME_EXTRA_PACKAGES}" ]]; then \
+      /opt/venv/bin/python -m pip install --upgrade \
+        --index-url https://download.pytorch.org/whl/cu132 \
+        --extra-index-url https://pypi.org/simple \
+        --constraint /tmp/torch-cu132-constraints.txt \
+        ${VLLM_RUNTIME_EXTRA_PACKAGES}; \
+    fi
+
+# Same sbsa platform-tag normalization as the build base (see comment there);
+# packages installed above (including VLLM_RUNTIME_EXTRA_PACKAGES) may pull
+# fresh NVIDIA aarch64 wheels. No-op on x86. The pip check that upstream runs
+# inside the install step happens after normalization instead.
+RUN /opt/venv/bin/python - <<'FIXSBSA'
+import base64, csv, glob, hashlib, io, pathlib
+
+for wheel in glob.glob("/opt/venv/lib/python*/site-packages/*.dist-info/WHEEL"):
+    path = pathlib.Path(wheel)
+    text = path.read_text()
+    if "manylinux2014_sbsa" not in text:
+        continue
+    path.write_text(text.replace("manylinux2014_sbsa", "manylinux2014_aarch64"))
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    record_path = path.parent / "RECORD"
+    rows = list(csv.reader(io.StringIO(record_path.read_text())))
+    for row in rows:
+        if row and row[0].endswith(".dist-info/WHEEL"):
+            row[1] = f"sha256={digest}"
+            row[2] = str(len(data))
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(rows)
+    record_path.write_text(out.getvalue())
+    print(f"normalized sbsa platform tag: {wheel}")
+FIXSBSA
+
+RUN /opt/venv/bin/python -m pip check
+
+# Install only the dependencies needed by the in-process RAM and buffered
+# filesystem tiers. LMCache's cloud/GDS dependencies are intentionally omitted
+# so it cannot downgrade the release's NumPy or OpenTelemetry stack.
+RUN --mount=type=bind,from=lmcache-build,source=/tmp/lmcache-wheels,target=/tmp/lmcache-wheels,ro \
+    /opt/venv/bin/python -m pip install \
+      sortedcontainers==2.4.0 \
+      aiofile==3.11.1 \
+      aiofiles==25.1.0 \
+      cupy-cuda13x==13.6.0 \
+      redis==8.0.1 \
+      opentelemetry-exporter-prometheus==0.65b0 \
+ && /opt/venv/bin/python -m pip install --no-deps --force-reinstall \
+      /tmp/lmcache-wheels/lmcache-*.whl \
+ && LMCACHE_BUILD_VERSION="${LMCACHE_BUILD_VERSION}" /opt/venv/bin/python - <<'PY'
+import importlib.metadata as md
+import os
+
+import cupy
+from lmcache.integration.vllm.vllm_multi_process_adapter import ParallelStrategy
+
+assert md.version("lmcache") == os.environ["LMCACHE_BUILD_VERSION"]
+assert md.version("cupy-cuda13x") == "13.6.0"
+strategy = ParallelStrategy(
+    use_mla=True,
+    vllm_world_size=8,
+    vllm_worker_id=5,
+    tp_size=8,
+    pp_size=1,
+    n_servers=1,
+    dcp_size=4,
+)
+assert strategy.kv_world_size == 4
+assert strategy.kv_worker_id == 1
+assert strategy.kv_tp_size == 2
+assert strategy.kv_readers_per_object == 2
+print("lmcache", md.version("lmcache"))
+PY
+
+RUN if [[ -n "${INSTANTTENSOR_REF}" ]]; then \
+      git clone --recursive "${INSTANTTENSOR_REPO}" /tmp/instanttensor-src; \
+      cd /tmp/instanttensor-src; \
+      if [[ "${INSTANTTENSOR_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+        git fetch --depth=1 origin "${INSTANTTENSOR_REF}"; \
+        git checkout FETCH_HEAD; \
+      else \
+        git checkout "${INSTANTTENSOR_REF}"; \
+      fi; \
+      git submodule update --init --recursive; \
+      if [[ -n "${INSTANTTENSOR_COMMIT}" ]]; then [[ "$(git rev-parse HEAD)" = "${INSTANTTENSOR_COMMIT}" ]] || { echo "ERROR: INSTANTTENSOR_COMMIT mismatch: HEAD=$(git rev-parse HEAD) expected=${INSTANTTENSOR_COMMIT}" >&2; exit 1; }; fi; \
+      /opt/venv/bin/python -m pip install --no-build-isolation --no-deps --force-reinstall .; \
+      cd /; \
+      rm -rf /tmp/instanttensor-src; \
+    fi \
+ && /opt/venv/bin/python - <<'PY'
+import importlib.metadata as md
+import instanttensor
+
+print("instanttensor", md.version("instanttensor"), instanttensor.__file__)
+PY
+
+# The base and CUDA-specific CuTe DSL wheels currently contain overlapping
+# Python paths. Reinstall the CUDA 13 wheel last and verify its SM120 MMA API so
+# a later dependency transaction cannot silently replace it with base files.
+RUN /opt/venv/bin/python -m pip install --force-reinstall --no-deps \
+      "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+ && CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" /opt/venv/bin/python - <<'PY'
+import hashlib
+import importlib.metadata as md
+import os
+from pathlib import Path
+
+import cutlass.cute as cute
+
+version = os.environ["CUTLASS_DSL_VERSION"]
+mma = Path(cute.__file__).parent / "nvgpu" / "warp" / "mma.py"
+assert md.version("nvidia-cutlass-dsl") == version
+assert md.version("nvidia-cutlass-dsl-libs-base") == version
+assert md.version("nvidia-cutlass-dsl-libs-cu13") == version
+assert hasattr(cute.nvgpu.warp, "MmaMXF8Op")
+if version == "4.5.3":
+    assert hashlib.sha256(mma.read_bytes()).hexdigest() == (
+        "cccf48864bae9554acdf708fd66a7b2fe729948ca3768205df3e251c8dc71fd2"
+    )
+print("CUTLASS DSL CUDA 13 overlay: PASS", mma)
+PY
+
+# The venv copied from vllm-build has the torch libnccl path already
+# symlinked to /opt/libnccl.so.2.30.4 (build-base did the surgery), but this
+# stage starts FROM the system base, which only ships the local-inference
+# copy. Materialize /opt/libnccl.so.2.30.4 first so the symlink resolves,
+# then run the existence checks.
+#
+# The torch-bundled NCCL backup must NOT live inside nvidia/nccl/lib: torch's
+# CUDA-deps preloader globs that directory (libnccl.so.*) in arbitrary
+# directory order and can dlopen the 2.29.7 backup instead of the patched
+# 2.30.4 symlink. Keep the backup in /opt instead.
+RUN torch_nccl=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
+ && local_nccl=/opt/libnccl-local-inference.so.2.30.4 \
+ && normal_nccl=/opt/libnccl.so.2.30.4 \
+ && test -e "${local_nccl}" \
+ && if [[ ! -e "${normal_nccl}" ]]; then cp -aL "${local_nccl}" "${normal_nccl}"; fi \
+ && test -e "${torch_nccl}" \
+ && if [[ ! -e "${local_nccl}.orig" ]]; then cp -aL "${local_nccl}" "${local_nccl}.orig"; fi \
+ && if [[ ! -e "${torch_nccl}.torch-bundled-2.29.7" && ! -e /opt/libnccl-torch-bundled-2.29.7.orig ]]; then cp -aL "${torch_nccl}" /opt/libnccl-torch-bundled-2.29.7.orig; fi \
+ && if [[ -e "${torch_nccl}.torch-bundled-2.29.7" ]]; then mv "${torch_nccl}.torch-bundled-2.29.7" /opt/libnccl-torch-bundled-2.29.7.orig; fi \
+ && readelf -d "${normal_nccl}" | grep -F 'Library soname: [libnccl.so.2]' \
+ && ln -sfn "${normal_nccl}" "${local_nccl}" \
+ && ln -sfn "${normal_nccl}" /opt/libnccl.so.2 \
+ && ln -sfn "${normal_nccl}" "${torch_nccl}" \
+ && ldconfig \
+ && /opt/venv/bin/python - <<'PY'
+import torch
+
+paths = []
+with open("/proc/self/maps", encoding="utf-8") as maps:
+    for line in maps:
+        if "libnccl" in line:
+            paths.append(line.split()[-1])
+
+unique = sorted(set(paths))
+print("torch nccl api", torch.cuda.nccl.version())
+print("mapped libnccl paths", unique)
+assert unique == ["/opt/libnccl.so.2.30.4"], unique
+PY
+
+RUN multiarch="$(uname -m)-linux-gnu" \
+ && cuda_target="$(basename "$(ls -d /usr/local/cuda/targets/*-linux | head -1)")" \
+ && cublas="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublas.so.13)" \
+ && cublas_lt="$(readlink -f /usr/lib/${multiarch}/libcublas/13/libcublasLt.so.13)" \
+ && cublas_name="$(basename "${cublas}")" \
+ && cublas_lt_name="$(basename "${cublas_lt}")" \
+ && test -f "${cublas}" \
+ && test -f "${cublas_lt}" \
+ && for cuda_libdir in /usr/local/cuda/targets/${cuda_target}/lib /usr/local/cuda-13.2/targets/${cuda_target}/lib; do \
+      if [[ -d "${cuda_libdir}" ]]; then \
+        cuda_libdir="$(readlink -f "${cuda_libdir}")"; \
+        rm -f "${cuda_libdir}"/libcublas.so "${cuda_libdir}"/libcublas.so.13 "${cuda_libdir}"/libcublas.so.13.*; \
+        rm -f "${cuda_libdir}"/libcublasLt.so "${cuda_libdir}"/libcublasLt.so.13 "${cuda_libdir}"/libcublasLt.so.13.*; \
+        ln -s "${cublas}" "${cuda_libdir}/${cublas_name}"; \
+        ln -s "${cublas_name}" "${cuda_libdir}/libcublas.so.13"; \
+        ln -s libcublas.so.13 "${cuda_libdir}/libcublas.so"; \
+        ln -s "${cublas_lt}" "${cuda_libdir}/${cublas_lt_name}"; \
+        ln -s "${cublas_lt_name}" "${cuda_libdir}/libcublasLt.so.13"; \
+        ln -s libcublasLt.so.13 "${cuda_libdir}/libcublasLt.so"; \
+      fi; \
+    done \
+ && ldconfig
+
+ARG CACHE_FINGERPRINT=unversioned
+ARG EXLLAMAV3_COMMIT
+
+ARG TORCH_CUDA_ARCH_LIST_ARG
+ARG FLASHINFER_CUDA_ARCH_LIST_ARG
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}" \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST_ARG} \
+    FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST_ARG} \
+    FLASHINFER_LOCAL_VERSION=cu132 \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    HF_HOME=/root/.cache/huggingface \
+    LOCAL_INFERENCE_CACHE_FINGERPRINT=${CACHE_FINGERPRINT} \
+    XDG_CACHE_HOME=/cache/jit/${CACHE_FINGERPRINT} \
+    VLLM_CACHE_ROOT=/cache/jit/${CACHE_FINGERPRINT}/vllm \
+    VLLM_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/vllm \
+    TRITON_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/triton \
+    TORCHINDUCTOR_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/torchinductor \
+    TORCH_EXTENSIONS_DIR=/cache/jit/${CACHE_FINGERPRINT}/torch_extensions \
+    FLASHINFER_WORKSPACE_BASE=/cache/jit/${CACHE_FINGERPRINT}/flashinfer \
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/flashinfer-autotune \
+    TVM_FFI_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tvm-ffi \
+    TVM_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tvm \
+    TILELANG_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tilelang \
+    TILELANG_TMP_DIR=/cache/jit/${CACHE_FINGERPRINT}/tilelang/tmp \
+    CUTE_DSL_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/cute-dsl \
+    B12X_CUTE_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/b12x-cute \
+    B12X_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/b12x/compile \
+    SPARKINFER_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/sparkinfer/compile \
+    DG_JIT_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/deep-gemm \
+    MM_SPARSE_ATTN_AOT_CACHE=/cache/jit/${CACHE_FINGERPRINT}/minfer/mm_sparse_attn \
+    MINFER_FMHA_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/minfer/fmha_sm100 \
+    CUDA_CACHE_PATH=/cache/jit/${CACHE_FINGERPRINT}/cuda \
+    CUPY_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/cupy \
+    NUMBA_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/numba \
+    NCCL_LOCAL_INFERENCE_PATH=/opt/libnccl-local-inference.so.2.30.4 \
+    NCCL_PR2127_PATH=/opt/libnccl-local-inference.so.2.30.4 \
+    VLLM_NCCL_SO_PATH=/opt/libnccl-local-inference.so.2.30.4 \
+    VLLM_EXL3_EXT_PATH=/opt/exllamav3 \
+    VLLM_EXL3_ENCODER_SOURCE=/opt/exllamav3-python/exllamav3 \
+    VLLM_EXL3_ENCODER_REVISION=${EXLLAMAV3_COMMIT} \
+    VLLM_EXL3_ONLINE_CACHE_DIR=/cache/exl3-online \
+    VLLM_EXL3_ONLINE_CACHE_MODE=readwrite \
+    LD_PRELOAD=/opt/libnccl-local-inference.so.2.30.4 \
+    NCCL_IB_DISABLE=1 \
+    NCCL_P2P_LEVEL=SYS \
+    NCCL_PROTO=LL,LL128,Simple \
+    VLLM_ENABLE_PCIE_ALLREDUCE=1 \
+    VLLM_PCIE_ALLREDUCE_BACKEND=cpp \
+    VLLM_CPP_AR_1STAGE_NCCL_CUTOFF=56KB \
+    VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS=0 \
+    VLLM_RTX6K_FUSED_ALLREDUCE_ADD=0 \
+    VLLM_RTX6K_FUSED_ALLREDUCE_ADD_END_BARRIER=0 \
+    VLLM_DISABLE_SHARED_EXPERTS_STREAM=0 \
+    VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1 \
+    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+    VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
+
+RUN mkdir -p \
+      "${XDG_CACHE_HOME}" \
+      "${VLLM_CACHE_ROOT}" \
+      "${TRITON_CACHE_DIR}" \
+      "${TORCHINDUCTOR_CACHE_DIR}" \
+      "${TORCH_EXTENSIONS_DIR}" \
+      "${FLASHINFER_WORKSPACE_BASE}" \
+      "${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR}" \
+      "${TVM_FFI_CACHE_DIR}" \
+      "${TVM_CACHE_DIR}" \
+      "${TILELANG_CACHE_DIR}" \
+      "${TILELANG_TMP_DIR}" \
+      "${CUTE_DSL_CACHE_DIR}" \
+      "${B12X_CUTE_COMPILE_CACHE_DIR}" \
+      "${SPARKINFER_COMPILE_CACHE_DIR}" \
+      "${DG_JIT_CACHE_DIR}" \
+      "${MM_SPARSE_ATTN_AOT_CACHE}" \
+      "${MINFER_FMHA_CACHE_DIR}" \
+      "${CUDA_CACHE_PATH}" \
+      "${CUPY_CACHE_DIR}" \
+      "${NUMBA_CACHE_DIR}" \
+      "${VLLM_EXL3_ONLINE_CACHE_DIR}" \
+ && strings /opt/libnccl-local-inference.so.2.30.4 | grep -F "NCCL version 2.30.4 compiled with CUDA 13.2" \
+ && /usr/local/bin/verify-vllm-b12x-cu132 /opt/vllm \
+ && python - <<'PY'
+import torch, flashinfer, vllm
+import deep_gemm
+print("torch", torch.__version__, torch.version.cuda)
+print("torch nccl", torch.cuda.nccl.version())
+print("flashinfer", getattr(flashinfer, "__version__", "unknown"))
+print("deep_gemm", getattr(deep_gemm, "__version__", "unknown"))
+print("vllm", getattr(vllm, "__version__", "unknown"))
+assert torch.__version__.startswith("2.12.0+cu132")
+assert torch.version.cuda == "13.2"
+PY
+
+WORKDIR /
+
+CMD ["/usr/local/bin/run-kimi26-vllm"]
+
+ARG VLLM_REPO
+ARG VLLM_REF
+ARG VLLM_COMMIT
+ARG VLLM_PATCH_URL
+ARG VLLM_PATCH_SHA256
+ARG VLLM_PATCH_FILE
+ARG VLLM_INTEGRATION_BASE_COMMIT
+ARG VLLM_INTEGRATION_TREE
+ARG VLLM_INTEGRATION_PRS
+ARG VLLM_INTEGRATION_LOCK_SHA256
+ARG B12X_REF
+ARG B12X_COMMIT
+ARG B12X_PATCH_SHA256
+ARG B12X_PATCH_FILE
+ARG B12X_INTEGRATION_BASE_COMMIT
+ARG B12X_INTEGRATION_TREE
+ARG B12X_INTEGRATION_PRS
+ARG B12X_INTEGRATION_LOCK_SHA256
+ARG FLASHINFER_REF
+ARG FLASHINFER_COMMIT
+ARG DEEPGEMM_REF
+ARG DEEPGEMM_COMMIT
+ARG DEEPGEMM_PATCH_FILE
+ARG DEEPGEMM_PATCH_SHA256
+ARG SKIP_EXLLAMAV3=0
+ARG TRITON_KERNELS_REF
+ARG TRITON_KERNELS_COMMIT
+ARG INSTANTTENSOR_REPO
+ARG INSTANTTENSOR_REF
+ARG INSTANTTENSOR_COMMIT
+ARG LAUNCHER_REF
+ARG LAUNCHER_COMMIT
+ARG VLLM_REQUIRED_LAUNCHERS
+ARG CUBLAS_CUDA13_VERSION
+ARG CUDNN_CUDA13_VERSION
+ARG CUDA_COMPAT_13_2_VERSION
+ARG CUTLASS_DSL_VERSION
+ARG TOKENSPEED_MLA_VERSION
+ARG TVM_FFI_VERSION
+ARG EXLLAMAV3_REPO
+ARG EXLLAMAV3_REF
+ARG EXLLAMAV3_COMMIT
+ARG LMCACHE_REPO
+ARG LMCACHE_REF
+ARG LMCACHE_COMMIT
+ARG LMCACHE_PATCH_SHA256
+ARG LMCACHE_BUILD_VERSION
+ARG LMCACHE_INTEGRATION_BASE_COMMIT
+ARG LMCACHE_INTEGRATION_TREE
+ARG LMCACHE_INTEGRATION_PRS
+ARG LMCACHE_INTEGRATION_LOCK_SHA256
+ARG XGRAMMAR_REPO
+ARG XGRAMMAR_REF
+ARG XGRAMMAR_COMMIT
+ARG XGRAMMAR_VERSION
+ARG XGRAMMAR_TRANSFORMERS5_COMPAT
+
+LABEL org.opencontainers.image.description="Clean CUDA 13.2.1 vLLM+SparkInfer image with PyTorch 2.12 cu132, patched NCCL 2.30.4, FlashInfer git, DeepGEMM, SparkInfer and selected vLLM branch" \
+      local-inference.cuda.version="13.2.1" \
+      local-inference.cuda.compat.version="${CUDA_COMPAT_13_2_VERSION}" \
+      local-inference.cublas.version="${CUBLAS_CUDA13_VERSION}" \
+      local-inference.cudnn.version="${CUDNN_CUDA13_VERSION}" \
+      local-inference.torch.version="2.12.0+cu132" \
+      local-inference.cutlass_dsl.version="${CUTLASS_DSL_VERSION}" \
+      local-inference.tokenspeed_mla.version="${TOKENSPEED_MLA_VERSION}" \
+      local-inference.tvm_ffi.version="${TVM_FFI_VERSION}" \
+      local-inference.cache.fingerprint="${CACHE_FINGERPRINT}" \
+      local-inference.nccl.repo="local-inference-lab/nccl-canonical" \
+      local-inference.nccl.branch="canonical/cu132-nccl2304-amd-noxml" \
+      local-inference.nccl.version="2.30.4" \
+      local-inference.vllm.repo="${VLLM_REPO}" \
+      local-inference.vllm.branch="${VLLM_REF}" \
+      local-inference.vllm.commit="${VLLM_COMMIT}" \
+      local-inference.vllm.patch_url="${VLLM_PATCH_URL}" \
+      local-inference.vllm.patch_sha256="${VLLM_PATCH_SHA256}" \
+      local-inference.vllm.patch_file="${VLLM_PATCH_FILE}" \
+      local-inference.vllm.integration.base_commit="${VLLM_INTEGRATION_BASE_COMMIT}" \
+      local-inference.vllm.integration.tree="${VLLM_INTEGRATION_TREE}" \
+      local-inference.vllm.integration.prs="${VLLM_INTEGRATION_PRS}" \
+      local-inference.vllm.integration.lock_sha256="${VLLM_INTEGRATION_LOCK_SHA256}" \
+      local-inference.b12x.branch="${B12X_REF}" \
+      local-inference.b12x.commit="${B12X_COMMIT}" \
+      local-inference.b12x.patch_sha256="${B12X_PATCH_SHA256}" \
+      local-inference.b12x.patch_file="${B12X_PATCH_FILE}" \
+      local-inference.b12x.integration.base_commit="${B12X_INTEGRATION_BASE_COMMIT}" \
+      local-inference.b12x.integration.tree="${B12X_INTEGRATION_TREE}" \
+      local-inference.b12x.integration.prs="${B12X_INTEGRATION_PRS}" \
+      local-inference.b12x.integration.lock_sha256="${B12X_INTEGRATION_LOCK_SHA256}" \
+      local-inference.b12x.runtime_version="source" \
+      local-inference.sparkinfer.branch="${B12X_REF}" \
+      local-inference.sparkinfer.commit="${B12X_COMMIT}" \
+      local-inference.sparkinfer.patch_sha256="${B12X_PATCH_SHA256}" \
+      local-inference.sparkinfer.patch_file="${B12X_PATCH_FILE}" \
+      local-inference.sparkinfer.integration.base_commit="${B12X_INTEGRATION_BASE_COMMIT}" \
+      local-inference.sparkinfer.integration.tree="${B12X_INTEGRATION_TREE}" \
+      local-inference.sparkinfer.integration.prs="${B12X_INTEGRATION_PRS}" \
+      local-inference.sparkinfer.integration.lock_sha256="${B12X_INTEGRATION_LOCK_SHA256}" \
+      local-inference.sparkinfer.runtime_version="source" \
+      local-inference.flashinfer.branch="${FLASHINFER_REF}" \
+      local-inference.flashinfer.commit="${FLASHINFER_COMMIT}" \
+      local-inference.deepgemm.branch="${DEEPGEMM_REF}" \
+      local-inference.deepgemm.commit="${DEEPGEMM_COMMIT}" \
+      local-inference.deepgemm.patch_file="${DEEPGEMM_PATCH_FILE}" \
+      local-inference.deepgemm.patch_sha256="${DEEPGEMM_PATCH_SHA256}" \
+      local-inference.triton_kernels.branch="${TRITON_KERNELS_REF}" \
+      local-inference.triton_kernels.commit="${TRITON_KERNELS_COMMIT}" \
+      local-inference.instanttensor.repo="${INSTANTTENSOR_REPO}" \
+      local-inference.instanttensor.branch="${INSTANTTENSOR_REF}" \
+      local-inference.instanttensor.commit="${INSTANTTENSOR_COMMIT}" \
+      local-inference.exllamav3.repo="${EXLLAMAV3_REPO}" \
+      local-inference.exllamav3.branch="${EXLLAMAV3_REF}" \
+      local-inference.exllamav3.commit="${EXLLAMAV3_COMMIT}" \
+      local-inference.exllamav3.skipped="${SKIP_EXLLAMAV3}" \
+      local-inference.lmcache.repo="${LMCACHE_REPO}" \
+      local-inference.lmcache.ref="${LMCACHE_REF}" \
+      local-inference.lmcache.commit="${LMCACHE_COMMIT}" \
+      local-inference.lmcache.patch_sha256="${LMCACHE_PATCH_SHA256}" \
+      local-inference.lmcache.version="${LMCACHE_BUILD_VERSION}" \
+      local-inference.lmcache.integration.base_commit="${LMCACHE_INTEGRATION_BASE_COMMIT}" \
+      local-inference.lmcache.integration.tree="${LMCACHE_INTEGRATION_TREE}" \
+      local-inference.lmcache.integration.prs="${LMCACHE_INTEGRATION_PRS}" \
+      local-inference.lmcache.integration.lock_sha256="${LMCACHE_INTEGRATION_LOCK_SHA256}" \
+      local-inference.xgrammar.repo="${XGRAMMAR_REPO}" \
+      local-inference.xgrammar.ref="${XGRAMMAR_REF}" \
+      local-inference.xgrammar.commit="${XGRAMMAR_COMMIT}" \
+      local-inference.xgrammar.version="${XGRAMMAR_VERSION}" \
+      local-inference.xgrammar.transformers5_compat="${XGRAMMAR_TRANSFORMERS5_COMPAT}" \
+      local-inference.launcher.branch="${LAUNCHER_REF}" \
+      local-inference.launcher.commit="${LAUNCHER_COMMIT}" \
+      local-inference.launchers="${VLLM_REQUIRED_LAUNCHERS}"

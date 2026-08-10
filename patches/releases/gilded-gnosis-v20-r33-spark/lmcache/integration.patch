@@ -1,0 +1,4262 @@
+diff --git a/csrc/storage_backends/connector_base.h b/csrc/storage_backends/connector_base.h
+index c2cd35a174a1225c467d1479ea347b0d6e5ebd0e..0df7677cef0d0172a7cb60f7c9f3599cb189b555 100644
+--- a/csrc/storage_backends/connector_base.h
++++ b/csrc/storage_backends/connector_base.h
+@@ -111,6 +111,9 @@ class ConnectorBase : public IStorageConnector {
+     auto [batch_future_id, batch_state, num_tiles, tile_size] =
+         prepare_batch_operation(num_items, Op::BATCH_TILE_SET);
+ 
++    // pre-allocate per-key results so partial store failures are visible
++    batch_state->per_key_results.assign(num_items, 0);
++
+     // fan out work to threads
+     for (size_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+       auto tile_req = create_tile_request(
+@@ -326,10 +329,30 @@ class ConnectorBase : public IStorageConnector {
+       }
+     }
+   }
++  // Records a per-key result for every key in the tile (continuing past
++  // failures instead of aborting the tile), then rethrows so batch-level
++  // ok=false semantics are preserved for consumers that ignore per-key
++  // results.
+   virtual void do_batch_set(ConnectionType& conn, const Request& req) {
++    bool any_failed = false;
++    std::string first_error;
+     for (size_t i = 0; i < req.keys.size(); ++i) {
+-      do_single_set(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
+-                    req.batch_chunk_num_bytes);
++      try {
++        do_single_set(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
++                      req.batch_chunk_num_bytes);
++        req.batch->per_key_results[req.start_idx + i] = 1;
++      } catch (const std::exception& e) {
++        req.batch->per_key_results[req.start_idx + i] = 0;
++        if (!any_failed) {
++          any_failed = true;
++          first_error = e.what();
++        }
++        fprintf(stderr, "[LMCache SET] key %s failed: %s\n",
++                req.keys[i].c_str(), e.what());
++      }
++    }
++    if (any_failed) {
++      throw std::runtime_error("batch set partially failed: " + first_error);
+     }
+   }
+   virtual void do_batch_exists(ConnectionType& conn, const Request& req) {
+@@ -612,9 +635,10 @@ class ConnectorBase : public IStorageConnector {
+         std::lock_guard<std::mutex> lk(req.batch->err_mu);
+         batch_comp.error = req.batch->first_error;
+       }
+-      // for batch exists and batch get, move per-key results
++      // move per-key results for every op that records them
+       if (req.batch->batch_op == Op::BATCH_TILE_EXISTS ||
+           req.batch->batch_op == Op::BATCH_TILE_GET ||
++          req.batch->batch_op == Op::BATCH_TILE_SET ||
+           req.batch->batch_op == Op::BATCH_TILE_DELETE) {
+         batch_comp.result_bytes = std::move(req.batch->per_key_results);
+       }
+diff --git a/csrc/storage_backends/fs/connector.cpp b/csrc/storage_backends/fs/connector.cpp
+index e54d98f54f5428afad363cf1c5f5f380cdd8fffb..727ed016f10ae0b0c6e863c4234439dbaac0e7f8 100644
+--- a/csrc/storage_backends/fs/connector.cpp
++++ b/csrc/storage_backends/fs/connector.cpp
+@@ -2,10 +2,22 @@
+ 
+ #include "connector.h"
+ #include <cerrno>
++#include <cstdint>
+ #include <cstdio>
+ #include <stdexcept>
+ #include <string>
+ 
++namespace {
++// O_DIRECT requires the buffer ADDRESS to be block-aligned as well as the
++// length; a misaligned address fails the read/write with EINVAL. Buffers
++// come from Python and carry no alignment guarantee, so fall back to
++// buffered I/O whenever either constraint is unmet.
++bool odirect_eligible(const void* buf, size_t len, size_t disk_block_size) {
++  return disk_block_size > 0 && len % disk_block_size == 0 &&
++         reinterpret_cast<uintptr_t>(buf) % disk_block_size == 0;
++}
++}  // namespace
++
+ namespace lmcache {
+ namespace connector {
+ 
+@@ -27,22 +39,23 @@ std::string FSConnector::replace_all(const std::string& str,
+ 
+ std::string FSConnector::key_to_filename(const std::string& key) {
+   // Input key format (from _object_key_to_string):
+-  //   Unsalted: <model_name>@<kv_rank_hex>@<chunk_hash_hex>
+-  //   Salted  : <model_name>@<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>
++  //   Legacy unsalted: <model_name>@<kv_rank_hex>@<chunk_hash_hex>
++  //   Legacy salted  : <model_name>@<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>
++  //   Current unsalted:
++  //     <model_name>@<kv_rank_hex>@<object_group_id_hex>@<chunk_hash_hex>
++  //   Current salted appends @<cache_salt> to the current unsalted shape.
+   //
+   // Output filename (matching fs_l2_adapter.py._object_key_to_filename):
+   //   Unsalted: <model_name_safe>@0x<kv_rank_hex>@<chunk_hash_hex>.data
+   //   Salted  :
+   //   <model_name_safe>@0x<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>.data
+   //
+-  // The unsalted 3-field shape is bit-identical to the pre-cache_salt
+-  // format, so existing cache directories remain valid.
+-  //
+-  // NOTE: both model_name and cache_salt are forbidden from containing
+-  // '@' (invariant enforced on the Python side), so splitting on '@'
+-  // is unambiguous — no marker, no rsplit.
++  // Four fields are intentionally not interpreted: that shape can mean a
++  // legacy salted key or a current unsalted key, and both map correctly by
++  // preserving every field after kv_rank verbatim.
+ 
+-  // Split on '@' — must yield 3 (unsalted) or 4 (salted) fields.
++  // Split on '@'. Current ObjectKey serialization has four or five fields;
++  // three-field legacy keys remain readable for cache compatibility.
+   std::vector<std::string> parts;
+   size_t start = 0;
+   for (size_t pos = 0; pos <= key.size(); ++pos) {
+@@ -51,34 +64,28 @@ std::string FSConnector::key_to_filename(const std::string& key) {
+       start = pos + 1;
+     }
+   }
+-  if (parts.size() != 3 && parts.size() != 4) {
++  if (parts.size() < 3 || parts.size() > 5) {
+     throw std::runtime_error(
+-        "FSConnector: malformed key (expected 3 or 4 '@'-separated fields): " +
++        "FSConnector: malformed key (expected 3 to 5 '@'-separated fields): " +
+         key);
+   }
+ 
+   const std::string& model_name = parts[0];
+   const std::string& kv_rank_hex = parts[1];
+-  const std::string& chunk_hash = parts[2];
+-  const std::string cache_salt = parts.size() == 4 ? parts[3] : std::string();
+ 
+   // Replace '/' with '-SEP-' for filesystem safety
+   std::string safe_model = replace_all(model_name, "/", PATH_SLASH_REPLACEMENT);
+ 
+-  // Emit filename. Salt is appended at the tail so the unsalted shape
+-  // matches what older builds wrote to disk.
++  // Emit the model and normalized rank, preserving all remaining fields.
+   std::string result;
+-  result.reserve(safe_model.size() + kv_rank_hex.size() + chunk_hash.size() +
+-                 cache_salt.size() + 32);
++  result.reserve(key.size() + 16);
+   result += safe_model;
+   result += KEY_SEP;
+   result += "0x";
+   result += kv_rank_hex;
+-  result += KEY_SEP;
+-  result += chunk_hash;
+-  if (!cache_salt.empty()) {
++  for (size_t i = 2; i < parts.size(); ++i) {
+     result += KEY_SEP;
+-    result += cache_salt;
++    result += parts[i];
+   }
+   result += FILE_EXT;
+   return result;
+@@ -174,8 +181,11 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
+   int flags = O_RDONLY;
+   bool do_odirect = conn.use_odirect;
+   if (do_odirect) {
+-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
+-    if (aligned) {
++    const bool split_aligned = conn.disk_block_size > 0 &&
++                               (conn.read_ahead_size == 0 ||
++                                len <= conn.read_ahead_size ||
++                                conn.read_ahead_size % conn.disk_block_size == 0);
++    if (odirect_eligible(buf, len, conn.disk_block_size) && split_aligned) {
+ #ifdef O_DIRECT
+       flags |= O_DIRECT;
+ #endif
+@@ -243,8 +253,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
+   int flags = O_CREAT | O_WRONLY | O_TRUNC;
+   bool do_odirect = conn.use_odirect;
+   if (do_odirect) {
+-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
+-    if (aligned) {
++    if (odirect_eligible(buf, len, conn.disk_block_size)) {
+ #ifdef O_DIRECT
+       flags |= O_DIRECT;
+ #endif
+diff --git a/csrc/storage_backends/fs/connector.h b/csrc/storage_backends/fs/connector.h
+index 03b7b9cc5e0a2cac7ab9e39404d80c760b4e9018..7b9010947c18de36684317ed7c2628c3d2be0161 100644
+--- a/csrc/storage_backends/fs/connector.h
++++ b/csrc/storage_backends/fs/connector.h
+@@ -21,7 +21,9 @@ static constexpr const char* FILE_EXT = ".data";
+ static constexpr const char* TMP_EXT = ".tmp";
+ 
+ // Per-worker connection state for the FS connector.
+-// Each worker maintains its own I/O buffer for O_DIRECT.
++// O_DIRECT engages per request only when both the transfer length and the
++// caller's buffer address are multiples of the disk block size; anything
++// else falls back to buffered I/O.
+ struct WorkerFSConn {
+   std::filesystem::path base_path;
+   std::filesystem::path tmp_dir;  // empty if not configured
+@@ -52,17 +54,20 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
+   // Build the filesystem-safe filename from a serialized key string.
+   //
+   // Input key (from NativeConnectorL2Adapter._object_key_to_string):
+-  //   Unsalted: "{model}@{kv_rank:08x}@{hash.hex()}"
+-  //   Salted  : "{model}@{kv_rank:08x}@{hash.hex()}@{cache_salt}"
++  //   Current unsalted:
++  //     "{model}@{kv_rank:08x}@{object_group:x}@{hash.hex()}"
++  //   Current salted appends "@{cache_salt}". Legacy three/four-field keys
++  //   without object_group_id remain supported.
+   //
+   // Output filename (matching fs_l2_adapter.py._object_key_to_filename):
+-  //   Unsalted: "{safe_model}@{kv_rank:#010x}@{hash.hex()}.data"
+-  //   Salted  : "{safe_model}@{kv_rank:#010x}@{hash.hex()}@{cache_salt}.data"
++  //   Current unsalted:
++  //     "{safe_model}@{kv_rank:#010x}@{object_group:x}@{hash.hex()}.data"
++  //   Current salted appends "@{cache_salt}" before ".data".
+   //
+   // Differences from the input: '/' in model becomes '-SEP-', kv_rank
+-  // gains a '0x' prefix, and '.data' is appended. Both model_name and
+-  // cache_salt are forbidden from containing '@' (enforced on the
+-  // Python side), so the parse is unambiguous.
++  // gains a '0x' prefix, and '.data' is appended. All fields after kv_rank
++  // are preserved because four fields can represent either a legacy salted
++  // key or a current unsalted key.
+   static std::string key_to_filename(const std::string& key);
+ 
+   static std::string replace_all(const std::string& str,
+diff --git a/csrc/storage_backends/mooncake/connector.cpp b/csrc/storage_backends/mooncake/connector.cpp
+index 685fa4165b188b517a5c0de50753e5ae2e596d6f..0d5109e0dbb5595476806071d62c6dedd6f2bf98 100644
+--- a/csrc/storage_backends/mooncake/connector.cpp
++++ b/csrc/storage_backends/mooncake/connector.cpp
+@@ -173,12 +173,23 @@ void MooncakeConnector::do_batch_set(WorkerMooncakeConn& conn,
+       conn.client->batch_put_from(req.keys, req.buf_ptrs, req.buf_lens);
+   ensure_batch_result_size(results, req.keys.size(), "batch_put_from");
+ 
++  // Record per-key results before failing the tile so partial store
++  // failures stay visible to consumers that honor them.
++  size_t first_failed = results.size();
+   for (size_t i = 0; i < results.size(); ++i) {
+-    if (results[i] != 0) {
+-      throw std::runtime_error("Mooncake batch_put_from failed for key: " +
+-                               req.keys[i]);
++    if (results[i] == 0) {
++      req.batch->per_key_results[req.start_idx + i] = 1;
++    } else {
++      req.batch->per_key_results[req.start_idx + i] = 0;
++      if (first_failed == results.size()) {
++        first_failed = i;
++      }
+     }
+   }
++  if (first_failed != results.size()) {
++    throw std::runtime_error("Mooncake batch_put_from failed for key: " +
++                             req.keys[first_failed]);
++  }
+ }
+ 
+ void MooncakeConnector::do_batch_exists(WorkerMooncakeConn& conn,
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index d268070c3c0daa534a616c88312f8da7b5c665de..21af3747ede9f78c608841a692acc9c25e0bbc29 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -464,6 +464,42 @@ class LMCacheMPRequestMetadata:
+             "number of LMCache hit tokens. "
+         )
+         if end_token_idx > start_token_idx:
++            # allocated_block_ids must cover [start_token_idx, end_token_idx)
++            # in every engine group. slice_block_ids_per_group() validates
++            # chunk alignment only; its plain Python slice truncates
++            # silently, so a tracker primed with LMCache hit counts on a
++            # scheduling pass whose allocation never materialised would emit
++            # a retrieve op with too few block ids. The MP server fails
++            # closed on the short list, wasting a doomed round-trip and
++            # relying on the failure being surfaced at all. Suppress the op
++            # instead so the request recomputes cleanly. Never clamp
++            # end_token_idx: a clamped retrieve completes a load vLLM does
++            # not expect and re-creates the desync downstream.
++            # One allocated id of group g covers group_tokens_per_block[g]
++            # global token positions (KV-spec block_size, DCP-scaled), the
++            # same arithmetic GetStoreMetadata uses to bound its
++            # allocated_tokens.
++            for group_idx, tokens_per_block in enumerate(group_tokens_per_block):
++                allocated = len(tracker.allocated_block_ids.get(group_idx, []))
++                if allocated * tokens_per_block < end_token_idx:
++                    logger.warning(
++                        "LMCache retrieve suppressed for request_id=%s: "
++                        "engine group %d has %d allocated block(s) x %d "
++                        "tokens/block = %d tokens < end_token_idx=%d "
++                        "(start_token_idx=%d, vllm_hit_tokens=%d, "
++                        "lmcache_hit_tokens=%d) -- tracker/allocation "
++                        "desync; falling back to recompute.",
++                        tracker.request_id,
++                        group_idx,
++                        allocated,
++                        tokens_per_block,
++                        allocated * tokens_per_block,
++                        end_token_idx,
++                        start_token_idx,
++                        tracker.num_vllm_hit_tokens,
++                        tracker.num_lmcache_hit_tokens,
++                    )
++                    return None
+             block_ids = slice_block_ids_per_group(
+                 tracker.allocated_block_ids,
+                 group_tokens_per_block,
+diff --git a/lmcache/integration/vllm/vllm_multi_process_adapter.py b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+index d74fe3af02cbefc7755c8446434a36034c681ef3..dd5aa0e6033292eaad06dd8f0b7961d58cf6b2f1 100644
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -1173,8 +1173,11 @@ class LMCacheMPWorkerAdapter:
+         self.store_events: dict[str, list[_IpcEvent]] = {}
+         self.retrieve_events: dict[str, _IpcEvent] = {}
+ 
+-        # Block IDs that failed due to retrieve timeout
++        # Block IDs of failed retrieves (timeout, server-reported failure,
++        # or raising future), consumed by get_block_ids_with_load_errors().
+         self.error_block_ids: set[int] = set()
++        # Total failed retrieves on this worker, for log-based diagnostics.
++        self.retrieve_failure_count: int = 0
+ 
+         # Retrieve request ids dropped by the unhealthy early-return of
+         # submit_retrieve_request. get_finished must still report each id
+@@ -1657,6 +1660,9 @@ class LMCacheMPWorkerAdapter:
+             - The second set contains the finished retrieve request ids,
+                 including retrieves dropped at submit time while unhealthy
+                 (reported exactly once; blocks already in error_block_ids).
++                A failed retrieve (server result False or a raising future)
++                is reported finished with its block ids recorded in
++                error_block_ids so the scheduler recomputes them.
+ 
+         Notes:
+             When enabling async scheduling in vLLM, the same request ID may appear
+@@ -1701,19 +1707,45 @@ class LMCacheMPWorkerAdapter:
+ 
+         finished_stores = self._poll_store_futures()
+         finished_retrieves = set()
+-        for request_id, (r_future, _) in self.retrieve_futures.items():
++        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
+             if not r_future.query():
+                 continue
+ 
+-            r_result = r_future.result()
++            try:
++                r_result = r_future.result()
++            except Exception as exc:
++                # A raising future must not propagate out of get_finished
++                # (that would kill the engine step); contain it as a failed
++                # retrieve on the standard failure path.
++                logger.error(
++                    "LMCache retrieve future raised for request_id=%s: %r "
++                    "-- treating as failed retrieve.",
++                    request_id,
++                    exc,
++                )
++                r_result = False
+             finished_retrieves.add(request_id)
+ 
+             if not r_result:
++                # Surface the failure to the scheduler. Reporting the
++                # request finished without recording the failed span would
++                # ACK the load as successful: the request then decodes over
++                # never-written GPU blocks and the phantom blocks enter the
++                # shared prefix cache. error_block_ids feeds
++                # get_block_ids_with_load_errors() ->
++                # kv_connector_output.invalid_block_ids -> scheduler
++                # recompute. The MP server collapses per-key results into
++                # one bool, so marking the op's whole span is
++                # conservative-correct for partial failures too.
++                self.error_block_ids.update(r_block_ids)
++                self.retrieve_failure_count += 1
+                 logger.error(
+-                    "Something went wrong when processing the "
+-                    "retrieve request for request_id=%s, result=%s",
++                    "LMCache retrieve failed for request_id=%s: %d block(s) "
++                    "marked invalid for scheduler recompute "
++                    "(total retrieve failures this worker: %d)",
+                     request_id,
+-                    r_result,
++                    len(r_block_ids),
++                    self.retrieve_failure_count,
+                 )
+ 
+         # Store futures and events are removed together by _poll_store_futures.
+@@ -1758,8 +1790,8 @@ class LMCacheMPWorkerAdapter:
+ 
+     def get_block_ids_with_load_errors(self) -> set[int]:
+         """
+-        Returns the block IDs that failed due to retrieve timeout,
+-        then clears the internal set.
++        Returns the block IDs of failed retrieves (timeout, server-reported
++        failure, or raising future), then clears the internal set.
+         """
+         errors = self.error_block_ids.copy()
+         self.error_block_ids.clear()
+diff --git a/lmcache/v1/distributed/config.py b/lmcache/v1/distributed/config.py
+index de36535a57df7ceb8ca8bbb97276c4733e568270..ac11158668fdbfd00f36512cc08a90b7f42860b4 100644
+--- a/lmcache/v1/distributed/config.py
++++ b/lmcache/v1/distributed/config.py
+@@ -226,6 +226,21 @@ class EvictionConfig:
+     extra_logging_interval: float = field(default=10.0)
+     """ Seconds between L1 memory usage log lines when extra logging is enabled. """
+ 
++    write_back_on_evict: bool = field(default=False)
++    """ Flush evicted L1 objects to L2 synchronously and delete them from L1
++    only once every key in the batch is durable; without this, eviction
++    discards the objects. Requires an L2 adapter with store_objects_sync(). """
++
++    periodic_flush_interval: float = field(default=0.0)
++    """ Seconds between periodic L1-to-L2 backup flush scans while below the
++    eviction watermark (0 disables). Backup keeps the L1 copy; only L2 gains
++    a copy, so a restart or session expiry no longer costs a cold prefill. """
++
++    emergency_evict_for_prefetch: bool = field(default=False)
++    """ Allow the prefetch controller to synchronously evict LRU L1 keys to
++    make room for large L2-to-L1 restores. Effective only together with
++    write_back_on_evict, so victims are persisted before deletion. """
++
+ 
+ @dataclass
+ class StorageManagerConfig:
+@@ -296,6 +311,12 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
+         ValueError: If mutually exclusive L1 tiers are both configured, or
+             hybrid L1 is paired with incompatible L2 adapters.
+     """
++    eviction = config.eviction_config
++    if eviction.periodic_flush_interval < 0:
++        raise ValueError("periodic_flush_interval must be >= 0")
++    if eviction.emergency_evict_for_prefetch and not eviction.write_back_on_evict:
++        raise ValueError("emergency_evict_for_prefetch requires write_back_on_evict")
++
+     if (
+         config.l1_manager_config.gds_l1_config is not None
+         and config.l1_manager_config.memory_config.devdax_path
+@@ -471,6 +492,28 @@ def add_storage_manager_args(
+         help="The fraction of memory to evict when triggered (0.0 to 1.0). "
+         "Default is 0.2.",
+     )
++    eviction_group.add_argument(
++        "--write-back-on-evict",
++        action="store_true",
++        help="Flush evicted L1 objects to L2 synchronously and delete them "
++        "from L1 only once every key in the batch is durable. Requires an "
++        "L2 adapter with a synchronous store path.",
++    )
++    eviction_group.add_argument(
++        "--periodic-flush-interval",
++        type=float,
++        default=0.0,
++        help="Seconds between periodic L1-to-L2 backup flush scans while "
++        "below the eviction watermark (0 disables). The backup keeps the "
++        "L1 copy; only L2 gains a copy.",
++    )
++    eviction_group.add_argument(
++        "--emergency-evict-for-prefetch",
++        action="store_true",
++        help="Allow the prefetch controller to synchronously evict LRU L1 "
++        "keys to make room for large L2-to-L1 restores. Effective only "
++        "together with --write-back-on-evict.",
++    )
+ 
+     # L2 Policies
+     # Import here to break circular dependency:
+@@ -596,6 +639,11 @@ def parse_args_to_config(
+         eviction_ratio=args.eviction_ratio,
+         extra_logging_enabled=getattr(args, "enable_extra_logging", False),
+         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
++        write_back_on_evict=getattr(args, "write_back_on_evict", False),
++        periodic_flush_interval=getattr(args, "periodic_flush_interval", 0.0),
++        emergency_evict_for_prefetch=getattr(
++            args, "emergency_evict_for_prefetch", False
++        ),
+     )
+ 
+     l2_adapter_config = parse_args_to_l2_adapters_config(args)
+diff --git a/lmcache/v1/distributed/l1_manager.py b/lmcache/v1/distributed/l1_manager.py
+index 44cf55f615f2bf491bdf72784ac152a7ee422457..4a2be000b86a576759cb3d5579acbc45181b14e7 100644
+--- a/lmcache/v1/distributed/l1_manager.py
++++ b/lmcache/v1/distributed/l1_manager.py
+@@ -5,6 +5,7 @@ Managing objects and memory for L1 cache
+ 
+ # Standard
+ from dataclasses import dataclass
++from itertools import chain, islice
+ from typing import Literal
+ import threading
+ 
+@@ -462,6 +463,11 @@ class L1Manager:
+         Errors:
+             KEY_NOT_WRITABLE: The key exists but is not writable.
+             OUT_OF_MEMORY: Not enough memory to allocate for the object.
++
++        Note:
++            When the full batch does not fit, the longest prefix of the
++            to-be-allocated keys that fits is allocated and the remaining
++            keys report OUT_OF_MEMORY.
+         """
+         need_to_allocate: list[tuple[ObjectKey, bool]] = []
+         ret: dict[ObjectKey, L1OperationResult] = {}
+@@ -499,6 +505,26 @@ class L1Manager:
+             layout_desc, len(need_to_allocate)
+         )
+ 
++        # A full-batch allocation failure would fail every key even when
++        # most of the batch fits, collapsing large L2->L1 restores to zero
++        # prefix hits and forcing full re-prefills upstream. Fall back to
++        # allocating the longest prefix that fits; callers already handle
++        # per-key OOM (prefetch trims to the contiguous prefix, the store
++        # path skips failed keys).
++        if err != L1Error.SUCCESS and len(need_to_allocate) > 1:
++            if allocated_objs:
++                self._memory_manager.free(allocated_objs)
++                allocated_objs = []
++            err, allocated_objs = self._allocate_largest_prefix(
++                layout_desc, len(need_to_allocate)
++            )
++            if err == L1Error.SUCCESS:
++                logger.warning(
++                    "Partial L1 allocation: %d/%d objects (prefix) allocated",
++                    len(allocated_objs),
++                    len(need_to_allocate),
++                )
++
+         if err != L1Error.SUCCESS:
+             for key, _ in need_to_allocate:
+                 ret[key] = (L1Error.OUT_OF_MEMORY, None)
+@@ -508,6 +534,10 @@ class L1Manager:
+                 self._memory_manager.free(allocated_objs)
+ 
+         else:
++            # Mark any unallocated tail as OOM so every requested key keeps
++            # an explicit per-key result.
++            for key, _ in need_to_allocate[len(allocated_objs) :]:
++                ret[key] = (L1Error.OUT_OF_MEMORY, None)
+             for (key, is_temp), mem_obj in zip(
+                 need_to_allocate, allocated_objs, strict=False
+             ):
+@@ -531,6 +561,41 @@ class L1Manager:
+         )
+         return ret
+ 
++    def _allocate_largest_prefix(
++        self, layout_desc: MemoryLayoutDesc, want: int
++    ) -> tuple[L1Error, list[MemoryObj]]:
++        """Allocate the largest prefix below an already-failed full batch.
++
++        L1 allocators have an all-or-nothing batch contract. While holding the
++        L1 manager lock, allocation feasibility is therefore monotonic: if a
++        batch of size ``n`` fits, every smaller batch also fits. Binary search
++        finds the maximum without relying on byte estimates that can be wrong
++        for alignment or fragmented free lists. Successful probes are freed
++        before the final allocation.
++
++        This recovery path runs only after the ``want`` allocation failed, so
++        normal reservations still perform exactly one allocation.
++        """
++        low = 1
++        high = want - 1
++        largest = 0
++
++        while low <= high:
++            candidate = (low + high) // 2
++            err, objects = self._memory_manager.allocate(layout_desc, candidate)
++            if err == L1Error.SUCCESS:
++                largest = candidate
++                self._memory_manager.free(objects)
++                low = candidate + 1
++            else:
++                if objects:
++                    self._memory_manager.free(objects)
++                high = candidate - 1
++
++        if largest == 0:
++            return L1Error.OUT_OF_MEMORY, []
++        return self._memory_manager.allocate(layout_desc, largest)
++
+     @l1_mgr_synchronized
+     def finish_write(
+         self,
+@@ -793,6 +858,59 @@ class L1Manager:
+             locked_count,
+         )
+ 
++    @l1_mgr_synchronized
++    def get_evictable_keys(
++        self,
++        limit: int,
++        cursor: int = 0,
++        scan_limit: int | None = None,
++    ) -> tuple[list[ObjectKey], int]:
++        """Return a bounded, rotating batch of evictable keys.
++
++        ``cursor`` is an insertion-order offset returned by the previous call.
++        The scan wraps once and inspects at most ``scan_limit`` entries, so a
++        periodic backup cannot materialize the complete L1 keyspace while the
++        manager lock is held. Concurrent insertions or removals may shift the
++        offset, but every returned key is revalidated by ``reserve_read``.
++
++        Args:
++            limit: Maximum number of keys to return.
++            cursor: Insertion-order offset at which to resume scanning.
++            scan_limit: Maximum entries to inspect. Defaults to four batches.
++
++        Returns:
++            A pair of the eligible keys and the cursor for the next call.
++        """
++        if limit <= 0 or not self._objects:
++            return [], 0
++
++        object_count = len(self._objects)
++        start = cursor % object_count
++        max_scan = min(
++            object_count,
++            max(limit, scan_limit if scan_limit is not None else limit * 4),
++        )
++        ordered_keys = chain(
++            islice(self._objects, start, None),
++            islice(self._objects, 0, start),
++        )
++        keys: list[ObjectKey] = []
++        scanned = 0
++        for key in ordered_keys:
++            scanned += 1
++            if self.is_key_evictable(key):
++                keys.append(key)
++                if len(keys) >= limit:
++                    break
++            if scanned >= max_scan:
++                break
++        return keys, (start + scanned) % object_count
++
++    @l1_mgr_synchronized
++    def num_objects(self) -> int:
++        """Return the number of objects currently tracked in L1."""
++        return len(self._objects)
++
+     def is_key_evictable(self, key: ObjectKey) -> bool:
+         """Check if a key is eligible for eviction (not locked).
+ 
+diff --git a/lmcache/v1/distributed/l2_adapters/base.py b/lmcache/v1/distributed/l2_adapters/base.py
+index 1838553e285ce0f2c7a0b3d9a3180b6ad57ed499..dcc71deaa4c5097911fc810a6e80e80225baa384 100644
+--- a/lmcache/v1/distributed/l2_adapters/base.py
++++ b/lmcache/v1/distributed/l2_adapters/base.py
+@@ -135,6 +135,7 @@ class L2AdapterInterface(ABC):
+         # every adapter exposes the same shape via ``get_usage()``.
+         self._max_capacity_bytes: int = max_capacity_bytes
+         self._total_bytes_used: int = 0
++        self._reserved_store_bytes: int = 0
+         self._bytes_by_cache_salt: dict[str, int] = {}
+         self._usage_lock = threading.Lock()
+ 
+@@ -354,13 +355,8 @@ class L2AdapterInterface(ABC):
+         """Register a listener to receive L2 adapter events."""
+         self._listeners.append(listener)
+ 
+-    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+-        """Update byte accounting and notify listeners that ``keys`` were
+-        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
+-
+-        Accounting is held under ``_usage_lock``; listener callbacks fire
+-        outside the lock so a slow listener cannot stall further notifies.
+-        """
++    def _account_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
++        """Apply stored-key byte accounting without invoking listeners."""
+         # Aggregate per-salt deltas before touching
+         # ``_bytes_by_cache_salt`` — one dict read/write per unique
+         # salt instead of one per key. This matters when the registry is
+@@ -377,9 +373,90 @@ class L2AdapterInterface(ABC):
+                 self._bytes_by_cache_salt[salt] = (
+                     self._bytes_by_cache_salt.get(salt, 0) + d
+                 )
++
++    def _try_reserve_store_bytes(self, size: int) -> bool:
++        """Reserve capacity before an asynchronous L2 store is submitted.
++
++        The reservation covers transient backend storage as well as the final
++        object. This keeps a burst of in-flight writes from exceeding a hard
++        adapter capacity before completion accounting becomes visible.
++        """
++        if size < 0:
++            raise ValueError("store reservation size must be non-negative")
++        with self._usage_lock:
++            projected = self._total_bytes_used + self._reserved_store_bytes + size
++            if self._max_capacity_bytes > 0 and projected > self._max_capacity_bytes:
++                return False
++            self._reserved_store_bytes += size
++            return True
++
++    def _settle_store_reservation(
++        self,
++        reserved_bytes: int,
++        keys: list[ObjectKey],
++        sizes: list[int],
++    ) -> None:
++        """Atomically release a store reservation and account durable keys."""
++        if reserved_bytes < 0:
++            raise ValueError("reserved_bytes must be non-negative")
++
++        delta: dict[str, int] = {}
++        total_delta = 0
++        for key, size in zip(keys, sizes, strict=True):
++            delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
++            total_delta += size
++
++        with self._usage_lock:
++            if reserved_bytes > self._reserved_store_bytes:
++                raise RuntimeError(
++                    "store reservation accounting underflow: "
++                    f"settling {reserved_bytes} bytes with only "
++                    f"{self._reserved_store_bytes} reserved"
++                )
++            self._reserved_store_bytes -= reserved_bytes
++            self._total_bytes_used += total_delta
++            for salt, d in delta.items():
++                self._bytes_by_cache_salt[salt] = (
++                    self._bytes_by_cache_salt.get(salt, 0) + d
++                )
++
++    def _release_store_reservation(self, reserved_bytes: int) -> None:
++        """Release capacity for a store that will not produce a completion."""
++        if reserved_bytes < 0:
++            raise ValueError("reserved_bytes must be non-negative")
++        with self._usage_lock:
++            if reserved_bytes > self._reserved_store_bytes:
++                raise RuntimeError(
++                    "store reservation accounting underflow: "
++                    f"releasing {reserved_bytes} bytes with only "
++                    f"{self._reserved_store_bytes} reserved"
++                )
++            self._reserved_store_bytes -= reserved_bytes
++
++    def get_reserved_store_bytes(self) -> int:
++        """Return bytes reserved by submitted stores awaiting completion."""
++        with self._usage_lock:
++            return self._reserved_store_bytes
++
++    def _notify_keys_stored_listeners(
++        self,
++        keys: list[ObjectKey],
++        sizes: list[int],
++    ) -> None:
++        """Notify stored-key observers after accounting is committed."""
+         for listener in self._listeners:
+             listener.on_l2_keys_stored(keys, sizes)
+ 
++    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
++        """Update byte accounting and notify listeners that ``keys`` were
++        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
++
++        Accounting is held under ``_usage_lock``; listener callbacks fire
++        outside the lock so a slow listener cannot stall further notifies.
++        """
++        self._account_keys_stored(keys, sizes)
++        self._notify_keys_stored_listeners(keys, sizes)
++
+     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
+         # ``_notify_keys_accessed`` carries no byte impact — only LRU
+         # bookkeeping cares about it, so no accounting is needed here.
+diff --git a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+index 2d703499d20c5aa1c0ecc8e1f0667f2bf857c6a2..dacdead73b3eb1a34bec530fe14c535759607b2a 100644
+--- a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+@@ -10,9 +10,11 @@ Backed by the native C++ filesystem connector wrapped with
+ from __future__ import annotations
+ 
+ # Standard
++from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+ 
+ if TYPE_CHECKING:
++    from lmcache.v1.distributed.api import ObjectKey
+     from lmcache.v1.distributed.internal_api import (
+         L1MemoryDesc,
+     )
+@@ -158,7 +160,7 @@ def _create_fs_native_l2_adapter(
+         config.use_odirect,
+         config.read_ahead_size,
+     )
+-    return NativeConnectorL2Adapter(
++    adapter = NativeConnectorL2Adapter(
+         native_client,
+         max_capacity_gb=config.max_capacity_gb,
+         type_name="FSNativeL2Adapter",
+@@ -169,6 +171,53 @@ def _create_fs_native_l2_adapter(
+             "read_ahead_size": config.read_ahead_size,
+         },
+     )
++    try:
++        keys, sizes = _scan_existing_fs_native_files(config.base_path)
++        adapter.prime_existing_keys(keys, sizes)
++    except Exception:
++        adapter.close()
++        raise
++    return adapter
++
++
++def _scan_existing_fs_native_files(
++    base_path: str,
++) -> tuple[list["ObjectKey"], list[int]]:
++    """Recover durable keys and sizes, ordered from oldest to newest."""
++    # First Party
++    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
++        _filename_to_object_key,
++    )
++
++    root = Path(base_path)
++    if not root.is_dir():
++        return [], []
++
++    entries: list[tuple[int, str, ObjectKey, int]] = []
++    for path in root.glob("*.data"):
++        try:
++            if not path.is_file():
++                continue
++            key = _filename_to_object_key(path.name)
++            if key is None:
++                logger.warning("Ignoring unrecognized cache file: %s", path)
++                continue
++            stat = path.stat()
++            if stat.st_size <= 0:
++                logger.warning("Ignoring empty cache file: %s", path)
++                continue
++            entries.append((stat.st_mtime_ns, path.name, key, stat.st_size))
++        except OSError as exc:
++            # Silently omitting a durable object would under-report usage and
++            # seed an incomplete eviction index. Fail adapter construction so
++            # the operator can repair the directory or retry the startup scan.
++            raise RuntimeError(f"Could not inspect cache file {path}: {exc}") from exc
++
++    entries.sort(key=lambda entry: (entry[0], entry[1]))
++    return (
++        [entry[2] for entry in entries],
++        [entry[3] for entry in entries],
++    )
+ 
+ 
+ register_l2_adapter_type("fs_native", FSNativeL2AdapterConfig)
+diff --git a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+index c10d3802dfbdba50b6a49e4d764ebf10a567a0df..97518b74a161dd995548a7894eb0e13a3fed0df2 100644
+--- a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+@@ -30,7 +30,7 @@ import threading
+ from lmcache.logging import init_logger
+ from lmcache.native_storage_ops import Bitmap
+ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+-from lmcache.v1.distributed.internal_api import L2StoreResult
++from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
+ from lmcache.v1.distributed.l2_adapters.base import (
+     L2AdapterInterface,
+     L2TaskId,
+@@ -98,6 +98,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+ 
+     # Operation type tags for the pending-ops map
+     _OP_STORE = "store"
++    _OP_SYNC_STORE = "sync_store"
+     _OP_LOOKUP = "lookup"
+     _OP_LOAD = "load"
+     _OP_DELETE = "delete"
+@@ -144,15 +145,30 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         # Pending delete events for synchronous delete() calls
+         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
+ 
++        # Synchronous stores use private completions so StoreController cannot
++        # consume another thread's result from _completed_stores.
++        self._pending_sync_store_events: dict[
++            L2TaskId, tuple[threading.Event, dict[str, Any]]
++        ] = {}
++
+         # Per-key size tracking. ``_key_sizes`` lets us look up byte sizes
+         # at delete time (the native completion only carries booleans, not
+         # sizes) so we can pass them to ``_notify_keys_deleted``. Aggregate
+         # and per-user totals live in the base class — see ``get_usage``.
+         self._key_sizes: dict[ObjectKey, int] = {}
+-        # Pending store sizes: native future_id -> (keys, per_key_sizes).
++        # Pending store sizes:
++        #   native future_id -> (keys, per_key_sizes, reserved_bytes).
+         # Bridges the async store submit → demux completion gap so the
+         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
+-        self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
++        self._pending_store_sizes: dict[
++            int, tuple[list[ObjectKey], list[int], int]
++        ] = {}
++
++        # A filesystem factory may prime durable objects before the eviction
++        # listener exists. Keep one temporary startup snapshot for that first
++        # listener; _key_sizes remains the sole long-lived key index.
++        self._startup_primed = False
++        self._startup_replay: tuple[list[ObjectKey], list[int]] | None = None
+ 
+         # Task ID counter
+         self._next_task_id: L2TaskId = 0
+@@ -194,20 +210,39 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         key_strings = [_object_key_to_string(k) for k in keys]
+         memviews = [_obj_to_memoryview(obj) for obj in objects]
+         per_key_sizes = [obj.get_size() for obj in objects]
++        reserved_bytes = sum(per_key_sizes)
+ 
+         # Register pending op BEFORE submit to avoid race
+         # with demux thread. The native submit is
+         # non-blocking so holding the lock is brief.
+         with self._lock:
+             task_id = self._get_next_task_id()
+-            future_id = int(self._client.submit_batch_set(key_strings, memviews))
++            if not self._try_reserve_store_bytes(reserved_bytes):
++                self._completed_stores[task_id] = L2StoreResult(False, 0)
++                self._store_efd.notify()
++                logger.warning(
++                    "Rejected native L2 store of %d bytes: capacity would "
++                    "exceed %d bytes",
++                    reserved_bytes,
++                    self._max_capacity_bytes,
++                )
++                return task_id
++            try:
++                future_id = int(self._client.submit_batch_set(key_strings, memviews))
++            except Exception:
++                self._release_store_reservation(reserved_bytes)
++                raise
+             self._pending_ops[future_id] = (
+                 self._OP_STORE,
+                 task_id,
+                 len(keys),
+                 None,
+             )
+-            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
++            self._pending_store_sizes[future_id] = (
++                list(keys),
++                per_key_sizes,
++                reserved_bytes,
++            )
+ 
+         return task_id
+ 
+@@ -219,6 +254,83 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+             self._completed_stores = {}
+         return completed
+ 
++    def store_objects_sync(
++        self,
++        keys: list[ObjectKey],
++        objects: list[MemoryObj],
++        timeout: float | None = None,
++    ) -> tuple[bool, int, int]:
++        """Persist objects and wait for their native backend completion.
++
++        Returns ``(success, persisted_count, bytes_written)``. ``success`` is
++        true only when every key persisted, while the other fields account
++        for successful keys in a partially failed batch.
++        """
++        if len(keys) != len(objects):
++            raise ValueError("keys and objects length mismatch")
++        if not keys:
++            return True, 0, 0
++        if timeout is not None and timeout <= 0:
++            raise ValueError("timeout must be positive")
++
++        key_strings = [_object_key_to_string(key) for key in keys]
++        memviews = [_obj_to_memoryview(obj) for obj in objects]
++        per_key_sizes = [obj.get_size() for obj in objects]
++        reserved_bytes = sum(per_key_sizes)
++        done_event = threading.Event()
++        result: dict[str, Any] = {
++            "ok": False,
++            "persisted_count": 0,
++            "bytes_written": 0,
++        }
++
++        with self._lock:
++            task_id = self._get_next_task_id()
++            if not self._try_reserve_store_bytes(reserved_bytes):
++                logger.warning(
++                    "Rejected synchronous native L2 store of %d bytes: "
++                    "capacity would exceed %d bytes",
++                    reserved_bytes,
++                    self._max_capacity_bytes,
++                )
++                return False, 0, 0
++            try:
++                future_id = int(self._client.submit_batch_set(key_strings, memviews))
++            except Exception:
++                self._release_store_reservation(reserved_bytes)
++                raise
++            self._pending_ops[future_id] = (
++                self._OP_SYNC_STORE,
++                task_id,
++                len(keys),
++                None,
++            )
++            self._pending_store_sizes[future_id] = (
++                list(keys),
++                per_key_sizes,
++                reserved_bytes,
++            )
++            self._pending_sync_store_events[task_id] = (done_event, result)
++
++        wait_timeout = (
++            timeout if timeout is not None else max(30.0, min(300.0, len(keys) * 5.0))
++        )
++        if not done_event.wait(timeout=wait_timeout):
++            with self._lock:
++                self._pending_sync_store_events.pop(task_id, None)
++            logger.warning(
++                "store_objects_sync() timed out after %.1fs for %d keys",
++                wait_timeout,
++                len(keys),
++            )
++            return False, 0, 0
++
++        return (
++            bool(result["ok"]),
++            int(result["persisted_count"]),
++            int(result["bytes_written"]),
++        )
++
+     # ---------------------------------------------------------------
+     # Lookup and Lock Interface
+     # ---------------------------------------------------------------
+@@ -297,22 +409,46 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         tracking stays in sync.
+ 
+         No-op if the connector does not expose ``submit_batch_delete``
+-        or if the key list is empty.
++        or if the key list is empty. Keys currently lookup-locked by an
++        in-flight prefetch are skipped: the load task would race the
++        unlink and fail with a phantom not_found.
+         """
+         if not keys or not self._has_delete:
+             return
+ 
+-        key_strings = [_object_key_to_string(k) for k in keys]
+         done_event = threading.Event()
+ 
+         with self._lock:
++            # A key becomes lookup-locked only when the native EXISTS
++            # completion is demultiplexed. Protect pending lookup keys as
++            # well, otherwise eviction can delete a key between lookup
++            # submission and lock acquisition. Filtering and delete submit
++            # stay in one critical section so a new lookup cannot enter that
++            # same gap.
++            protected_keys = set(self._locked_keys)
++            for op_type, _task_id, _num_keys, op_keys in self._pending_ops.values():
++                if op_type == self._OP_LOOKUP and op_keys is not None:
++                    protected_keys.update(op_keys)
++
++            delete_keys = [key for key in keys if key not in protected_keys]
++            skipped_count = len(keys) - len(delete_keys)
++            if skipped_count:
++                logger.info(
++                    "delete(): skipping %d lookup-pending or locked keys; %d remain",
++                    skipped_count,
++                    len(delete_keys),
++                )
++            if not delete_keys:
++                return
++
++            key_strings = [_object_key_to_string(k) for k in delete_keys]
+             task_id = self._get_next_task_id()
+             future_id = int(self._client.submit_batch_delete(key_strings))
+             self._pending_ops[future_id] = (
+                 self._OP_DELETE,
+                 task_id,
+-                len(keys),
+-                list(keys),
++                len(delete_keys),
++                delete_keys,
+             )
+             self._pending_delete_events[task_id] = done_event
+ 
+@@ -328,7 +464,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+                         break
+             logger.warning(
+                 "delete() timed out after 30s for %d keys",
+-                len(keys),
++                len(delete_keys),
+             )
+             return
+ 
+@@ -345,6 +481,52 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+     # Status Interface
+     # ---------------------------------------------------------------
+ 
++    def prime_existing_keys(
++        self,
++        keys: list[ObjectKey],
++        sizes: list[int],
++    ) -> None:
++        """Account durable objects discovered before adapter registration."""
++        if len(keys) != len(sizes):
++            raise ValueError("keys and sizes length mismatch")
++
++        unique: dict[ObjectKey, int] = {}
++        for key, size in zip(keys, sizes, strict=True):
++            if size <= 0:
++                raise ValueError("existing object sizes must be positive")
++            unique.setdefault(key, int(size))
++
++        primed_keys = list(unique)
++        primed_sizes = list(unique.values())
++        with self._lock:
++            if self._startup_primed:
++                raise RuntimeError("existing keys were already primed")
++            if self._listeners:
++                raise RuntimeError("existing keys must be primed before listeners")
++            self._startup_primed = True
++            self._key_sizes.update(unique)
++            self._startup_replay = (primed_keys, primed_sizes)
++
++        # No listener is registered during factory construction. This uses
++        # the common accounting implementation without retaining a second
++        # byte-accounting path in this adapter.
++        if primed_keys:
++            self._notify_keys_stored(primed_keys, primed_sizes)
++            logger.info(
++                "Startup scan primed %.2f GB in %d existing objects",
++                sum(primed_sizes) / 1e9,
++                len(primed_keys),
++            )
++
++    def register_listener(self, listener: L2AdapterListener) -> None:
++        """Register a listener and replay the one-time startup snapshot."""
++        with self._lock:
++            replay = self._startup_replay
++            self._startup_replay = None
++        if replay is not None and replay[0]:
++            listener.on_l2_keys_stored(*replay)
++        super().register_listener(listener)
++
+     def report_status(self) -> dict[str, Any]:
+         """Return a status dict for this native-connector L2 adapter.
+ 
+@@ -360,6 +542,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         status: dict[str, Any] = {
+             "is_healthy": (self._demux_thread.is_alive() and not self._stop.is_set()),
+             "type": self._type_name,
++            "reserved_store_bytes": self.get_reserved_store_bytes(),
+         }
+         status.update(self._extra_status)
+         return status
+@@ -372,6 +555,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         self._stop.set()
+         self._demux_thread.join(timeout=5)
+ 
++        with self._lock:
++            sync_events = [
++                event for event, _result in self._pending_sync_store_events.values()
++            ]
++            self._pending_sync_store_events.clear()
++            abandoned_reservations = sum(
++                reserved_bytes
++                for _keys, _sizes, reserved_bytes in self._pending_store_sizes.values()
++            )
++            self._pending_store_sizes.clear()
++            self._pending_ops.clear()
++        if abandoned_reservations:
++            self._release_store_reservation(abandoned_reservations)
++        for event in sync_events:
++            event.set()
++
+         self._client.close()
+ 
+         self._store_efd.close()
+@@ -420,11 +619,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+             keys_accessed: list[ObjectKey] = []
+             keys_deleted: list[ObjectKey] = []
+             sizes_deleted: list[int] = []
++            settled_store_reservations = 0
+             # Events for synchronous ``delete()`` callers. We set these
+             # AFTER firing ``_notify_keys_deleted`` below so that when
+             # the caller unblocks and calls ``get_usage()``, the base
+             # class's byte counters already reflect the deletion.
+             delete_done_events: list[threading.Event] = []
++            sync_store_done_events: list[threading.Event] = []
+ 
+             with self._lock:
+                 for (
+@@ -449,12 +650,31 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+                         lookup_keys,
+                     ) = entry
+ 
+-                    if op_type == self._OP_STORE:
++                    if op_type in (self._OP_STORE, self._OP_SYNC_STORE):
+                         store_info = self._pending_store_sizes.pop(fid, None)
+                         task_bytes = 0
+-                        if ok and store_info is not None:
+-                            store_keys, sizes = store_info
+-                            for key, size in zip(store_keys, sizes, strict=True):
++                        persisted_count = 0
++                        completion_ok = False
++                        if store_info is not None:
++                            store_keys, sizes, reserved_bytes = store_info
++                            settled_store_reservations += reserved_bytes
++                            if result_bools is None:
++                                stored_flags = [bool(ok)] * len(store_keys)
++                            else:
++                                stored_flags = [bool(value) for value in result_bools]
++                                if len(stored_flags) < len(store_keys):
++                                    stored_flags.extend(
++                                        [False] * (len(store_keys) - len(stored_flags))
++                                    )
++                                elif len(stored_flags) > len(store_keys):
++                                    stored_flags = stored_flags[: len(store_keys)]
++                            completion_ok = bool(ok) and all(stored_flags)
++                            for key, size, stored in zip(
++                                store_keys, sizes, stored_flags, strict=True
++                            ):
++                                if not stored:
++                                    continue
++                                persisted_count += 1
+                                 # First-store wins for byte accounting:
+                                 # a re-store of an existing key adds 0
+                                 # bytes (the backend already holds it).
+@@ -470,8 +690,21 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+                                 else:
+                                     keys_stored.append(key)
+                                     sizes_stored.append(0)
+-                        self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
+-                        self._store_efd.notify()
++                        if op_type == self._OP_STORE:
++                            self._completed_stores[task_id] = L2StoreResult(
++                                completion_ok, task_bytes
++                            )
++                            self._store_efd.notify()
++                        else:
++                            sync_entry = self._pending_sync_store_events.pop(
++                                task_id, None
++                            )
++                            if sync_entry is not None:
++                                sync_event, sync_result = sync_entry
++                                sync_result["ok"] = completion_ok
++                                sync_result["persisted_count"] = persisted_count
++                                sync_result["bytes_written"] = task_bytes
++                                sync_store_done_events.append(sync_event)
+ 
+                     elif op_type == self._OP_LOOKUP:
+                         bitmap = Bitmap(num_keys)
+@@ -519,10 +752,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+                         if evt is not None:
+                             delete_done_events.append(evt)
+ 
+-            # Fire listener notifications outside the lock so a slow
+-            # listener cannot stall further demux iterations.
++            # Release in-flight reservations and commit durable-byte
++            # accounting in one critical section before waking callers.
++            if settled_store_reservations or keys_stored:
++                self._settle_store_reservation(
++                    settled_store_reservations,
++                    keys_stored,
++                    sizes_stored,
++                )
++            for evt in sync_store_done_events:
++                evt.set()
++
++            # Observer callbacks remain outside the lock and after synchronous
++            # durability completion. A slow observer must not defeat a caller's
++            # store timeout after persistence and accounting have committed.
+             if keys_stored:
+-                self._notify_keys_stored(keys_stored, sizes_stored)
++                self._notify_keys_stored_listeners(keys_stored, sizes_stored)
+             if keys_accessed:
+                 self._notify_keys_accessed(keys_accessed)
+             if keys_deleted:
+diff --git a/lmcache/v1/distributed/storage_controllers/eviction_controller.py b/lmcache/v1/distributed/storage_controllers/eviction_controller.py
+index 8624207de385ab334a102852b6d1b7c19d3182b0..899d8bf2166c2451fde6605dc839fa912e0e22f5 100644
+--- a/lmcache/v1/distributed/storage_controllers/eviction_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/eviction_controller.py
+@@ -6,7 +6,10 @@ from __future__ import annotations
+ # Standard
+ from abc import abstractmethod
+ from collections import Counter
++from enum import Enum, auto
+ from typing import TYPE_CHECKING
++import inspect
++import math
+ import threading
+ import time
+ 
+@@ -16,6 +19,7 @@ from lmcache.v1.distributed.api import ObjectKey
+ from lmcache.v1.distributed.config import EvictionConfig
+ from lmcache.v1.distributed.eviction import L1EvictionPolicy, L2EvictionPolicy
+ from lmcache.v1.distributed.eviction_policy import CreateEvictionPolicy
++from lmcache.v1.distributed.error import L1Error
+ from lmcache.v1.distributed.internal_api import (
+     EvictionAction,
+     EvictionDestination,
+@@ -33,6 +37,12 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++class _SyncFlushResult(Enum):
++    SUCCESS = auto()
++    FAILURE = auto()
++    DEADLINE_EXHAUSTED = auto()
++
++
+ class EvictionController(StorageControllerInterface):
+     """
+     Abstract base class for eviction controllers.
+@@ -92,12 +102,33 @@ class L1EvictionController(EvictionController):
+     Uses an L1EvictionPolicy bridge to keep the eviction policy up-to-date
+     with L1 manager events, and periodically triggers eviction based on
+     L1 memory usage.
++
++    With ``EvictionConfig.write_back_on_evict`` enabled and L2 adapters
++    injected via ``set_l2_adapters``, eviction actions target
++    ``EvictionDestination.L2_CACHE``: readable objects are synchronously
++    persisted to L2 in bounded batches and deleted from L1 only once every
++    key in the batch is durable. Repeated flush failures open a circuit
++    breaker that pauses write-back instead of retrying every second.
++
++    ``EvictionConfig.periodic_flush_interval`` additionally enables a
++    below-watermark backup flush that copies evictable L1 keys to L2
++    without deleting them from L1.
+     """
+ 
++    # Bounded batches keep each blocking sync-store call short.
++    _SYNC_FLUSH_BATCH_SIZE = 128
++    # Keys per periodic backup flush cycle.
++    _BACKUP_FLUSH_BATCH_SIZE = 128
++    # A prefetch request must not stall the controller indefinitely on L2.
++    _EMERGENCY_FLUSH_TIMEOUT_SECONDS = 1.0
++    # Periodic backup runs under the flush lock and must remain stoppable.
++    _PERIODIC_FLUSH_TIMEOUT_SECONDS = 5.0
++
+     def __init__(
+         self,
+         l1_manager: L1Manager,
+         eviction_config: EvictionConfig,
++        l2_adapters: dict[int, L2AdapterInterface] | None = None,
+     ):
+         super().__init__()
+         self._eviction_config = eviction_config
+@@ -108,13 +139,101 @@ class L1EvictionController(EvictionController):
+         self._event_bus = get_event_bus()
+         self._last_extra_log = time.monotonic()
+ 
++        self._write_back_enabled = bool(eviction_config.write_back_on_evict)
++        self._l2_adapters: dict[int, L2AdapterInterface] = {}
++        self._l2_adapter_supports_timeout: dict[int, bool] = {}
++        self._l2_adapters_lock = threading.Lock()
++        # Serializes all synchronous L2 flushes and adapter-set replacement.
++        # StorageManager can therefore remove an adapter only after any L1
++        # writeback currently using it has finished.
++        self._flush_lock = threading.Lock()
++        # Sync-flush circuit breaker: a dead L2 must not cause a
++        # multi-thousand-key synchronous retry and warning storm every
++        # second.
++        self._sync_flush_failures: int = 0
++        self._sync_flush_backoff_until: float = 0.0
++        self._last_backup_flush = time.monotonic()
++        self._backup_flush_cursor: int = 0
++        # Serializes emergency evictions from concurrent callers.
++        self._emergency_evict_lock = threading.Lock()
++        if self._write_back_enabled:
++            # Writeback must fail closed. Register the L2 destination even
++            # before a compatible adapter exists so policy never falls back
++            # to DISCARD when persistence is unavailable.
++            self._eviction_policy.register_eviction_destination(
++                EvictionDestination.L2_CACHE
++            )
++        if l2_adapters:
++            self.set_l2_adapters(l2_adapters)
++
++    def set_l2_adapters(self, l2_adapters: dict[int, L2AdapterInterface]) -> None:
++        """Late-inject L2 adapters after StorageManager creates them.
++
++        Only adapters with an explicit synchronous durability contract are
++        eligible. The L2 eviction destination itself is registered at
++        construction so enabled writeback always fails closed.
++        """
++        compatible: dict[int, L2AdapterInterface] = {}
++        supports_timeout: dict[int, bool] = {}
++        for adapter_id, adapter in l2_adapters.items():
++            sync_store = getattr(adapter, "store_objects_sync", None)
++            if not callable(sync_store):
++                continue
++            compatible[adapter_id] = adapter
++            try:
++                supports_timeout[adapter_id] = (
++                    "timeout" in inspect.signature(sync_store).parameters
++                )
++            except (TypeError, ValueError):
++                supports_timeout[adapter_id] = False
++        ignored = sorted(set(l2_adapters) - set(compatible))
++        if ignored:
++            logger.warning(
++                "L1 writeback ignored adapters without store_objects_sync: %s",
++                ignored,
++            )
++        with self._flush_lock:
++            with self._l2_adapters_lock:
++                self._l2_adapters = compatible
++                self._l2_adapter_supports_timeout = supports_timeout
++
++    def has_l2_flush_adapter(self) -> bool:
++        """Return whether a synchronous durability backend is available."""
++        return bool(self._snapshot_l2_adapters())
++
++    def _snapshot_l2_adapters(self) -> list[tuple[int, L2AdapterInterface]]:
++        with self._l2_adapters_lock:
++            return list(self._l2_adapters.items())
++
++    def _snapshot_l2_flush_adapters(
++        self,
++    ) -> list[tuple[int, L2AdapterInterface, bool]]:
++        with self._l2_adapters_lock:
++            return [
++                (
++                    adapter_id,
++                    adapter,
++                    self._l2_adapter_supports_timeout.get(adapter_id, False),
++                )
++                for adapter_id, adapter in self._l2_adapters.items()
++            ]
++
+     def report_status(self) -> dict:
++        adapters = self._snapshot_l2_adapters()
+         return {
+             "is_healthy": self._thread.is_alive(),
+             "thread_alive": self._thread.is_alive(),
+             "eviction_policy": self._eviction_config.eviction_policy,
+             "trigger_watermark": self._eviction_config.trigger_watermark,
+             "eviction_ratio": self._eviction_config.eviction_ratio,
++            "write_back_enabled": self._write_back_enabled,
++            "l2_flush_enabled": bool(adapters),
++            "l2_flush_adapter_ids": [adapter_id for adapter_id, _ in adapters],
++            "periodic_flush_interval": (self._eviction_config.periodic_flush_interval),
++            "sync_flush_failures": self._sync_flush_failures,
++            "sync_flush_backoff_seconds": max(
++                0.0, self._sync_flush_backoff_until - time.monotonic()
++            ),
+         }
+ 
+     def _publish_skipped(self, usage: float, watermark: float) -> None:
+@@ -160,6 +279,7 @@ class L1EvictionController(EvictionController):
+     def eviction_loop(self):
+         watermark = self._eviction_config.trigger_watermark
+         eviction_ratio = self._eviction_config.eviction_ratio
++        backup_interval = self._eviction_config.periodic_flush_interval
+ 
+         while not self._stop_flag.is_set():
+             time.sleep(1)
+@@ -168,6 +288,13 @@ class L1EvictionController(EvictionController):
+                 self._maybe_log_memory_usage(used_bytes, total_bytes)
+             usage = 0 if total_bytes == 0 else used_bytes / total_bytes
+             if usage < watermark:
++                if (
++                    backup_interval > 0
++                    and self._snapshot_l2_adapters()
++                    and time.monotonic() - self._last_backup_flush >= backup_interval
++                ):
++                    self._last_backup_flush = time.monotonic()
++                    self._backup_to_l2_no_delete(self._BACKUP_FLUSH_BATCH_SIZE)
+                 logger.debug(
+                     "L1 memory usage %.2f below watermark %.2f; skipping eviction.",
+                     usage,
+@@ -176,6 +303,13 @@ class L1EvictionController(EvictionController):
+                 self._publish_skipped(usage, watermark)
+                 continue
+ 
++            if (
++                self._write_back_enabled
++                and time.monotonic() < self._sync_flush_backoff_until
++            ):
++                self._publish_skipped(usage, watermark)
++                continue
++
+             logger.info(
+                 "L1 memory usage %.2f above watermark %.2f; triggering eviction.",
+                 usage,
+@@ -190,13 +324,340 @@ class L1EvictionController(EvictionController):
+             self._publish_triggered(usage, watermark)
+ 
+     def execute_eviction_action(self, action: EvictionAction):
+-        if action.destination == EvictionDestination.DISCARD:
++        if action.destination == EvictionDestination.L2_CACHE:
++            self._flush_to_l2_then_delete(action.keys)
++        elif action.destination == EvictionDestination.DISCARD:
+             self._l1_manager.delete(action.keys)
+         else:
+             logger.error("Unsupported eviction destination: %s", action.destination)
+             logger.error("Treating it as DISCARD.")
+             self._l1_manager.delete(action.keys)
+ 
++    def emergency_evict_bytes(self, target_free_bytes: int, requester: str = "") -> int:
++        """Synchronously evict LRU L1 keys until at least
++        ``target_free_bytes`` bytes are free.
++
++        Victims take the normal eviction path, so with write-back enabled
++        they are flushed to L2 before deletion. Intended for the prefetch
++        controller when a large L2-to-L1 restore cannot reserve L1 buffers.
++
++        Args:
++            target_free_bytes: The free-space goal in bytes.
++            requester: Optional label for logging.
++
++        Returns:
++            The free byte count after eviction.
++        """
++        deadline = time.monotonic() + self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
++        if not self._emergency_evict_lock.acquire(
++            timeout=self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
++        ):
++            used, total = self._l1_manager.get_memory_usage()
++            return max(0, total - used)
++        try:
++            used, total = self._l1_manager.get_memory_usage()
++            free = max(0, total - used)
++            if free >= target_free_bytes:
++                return free
++            deficit = target_free_bytes - free
++            num_objects = self._l1_manager.num_objects()
++            if num_objects <= 0:
++                return free
++            if self._write_back_enabled and (
++                time.monotonic() < self._sync_flush_backoff_until
++                or not self.has_l2_flush_adapter()
++            ):
++                return free
++            per_key = max(1, used // num_objects)
++            need_keys = math.ceil(deficit / per_key)
++            need_keys += max(1, math.ceil(need_keys / 8))
++            tracked = num_objects
++            get_tracked = getattr(self._eviction_policy, "get_num_tracked_keys", None)
++            if callable(get_tracked):
++                tracked = max(1, int(get_tracked()))
++            ratio = min(1.0, need_keys / max(tracked, 1))
++            start = time.monotonic()
++            actions = self._eviction_policy.get_eviction_actions(
++                ratio,
++                key_eligible_filter=self._l1_manager.is_key_evictable,
++            )
++            evicted_keys = 0
++            for action in actions:
++                evicted_keys += len(action.keys)
++                if action.destination == EvictionDestination.L2_CACHE:
++                    self._flush_to_l2_then_delete(action.keys, deadline=deadline)
++                else:
++                    self.execute_eviction_action(action)
++                if time.monotonic() >= deadline:
++                    break
++            used_after, total_after = self._l1_manager.get_memory_usage()
++            free_after = max(0, total_after - used_after)
++            logger.info(
++                "Emergency L1 eviction%s: wanted %.0f MB free, evicted %d "
++                "keys in %.0f ms; free %.0f MB -> %.0f MB",
++                (" for " + requester) if requester else "",
++                target_free_bytes / 1e6,
++                evicted_keys,
++                (time.monotonic() - start) * 1000.0,
++                free / 1e6,
++                free_after / 1e6,
++            )
++            return free_after
++        finally:
++            self._emergency_evict_lock.release()
++
++    def _flush_to_l2_then_delete(
++        self,
++        keys: list[ObjectKey],
++        deadline: float | None = None,
++    ) -> None:
++        """Persist bounded batches to L2 and delete only fully durable
++        batches from L1.
++
++        The native adapter reports a store successful only when every key
++        persisted, so this method conservatively retains the whole readable
++        batch on any partial failure. Repeated failures open the circuit
++        breaker with exponential backoff.
++        """
++        if deadline is None:
++            self._flush_lock.acquire()
++        else:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0 or not self._flush_lock.acquire(timeout=remaining):
++                return
++        try:
++            if not keys:
++                return
++            if time.monotonic() < self._sync_flush_backoff_until:
++                return
++
++            all_ok = True
++            deadline_exhausted = False
++            for start in range(0, len(keys), self._SYNC_FLUSH_BATCH_SIZE):
++                if deadline is not None and time.monotonic() >= deadline:
++                    deadline_exhausted = True
++                    break
++                batch = keys[start : start + self._SYNC_FLUSH_BATCH_SIZE]
++                result = self._flush_one_l2_batch_then_delete(batch, deadline=deadline)
++                if result == _SyncFlushResult.DEADLINE_EXHAUSTED:
++                    deadline_exhausted = True
++                    break
++                if result == _SyncFlushResult.FAILURE:
++                    all_ok = False
++                    break
++
++            if deadline_exhausted:
++                logger.debug(
++                    "L1-to-L2 emergency flush exhausted its time budget; "
++                    "remaining L1 keys preserved"
++                )
++            elif all_ok:
++                self._sync_flush_failures = 0
++                self._sync_flush_backoff_until = 0.0
++            else:
++                self._sync_flush_failures += 1
++                delay = min(60.0, float(2 ** min(self._sync_flush_failures, 6)))
++                self._sync_flush_backoff_until = time.monotonic() + delay
++                logger.warning(
++                    "L1-to-L2 flush circuit breaker: failure=%d, retry in %.0fs; "
++                    "remaining L1 keys preserved",
++                    self._sync_flush_failures,
++                    delay,
++                )
++        finally:
++            self._flush_lock.release()
++
++    def _flush_one_l2_batch_then_delete(
++        self,
++        keys: list[ObjectKey],
++        deadline: float | None = None,
++    ) -> _SyncFlushResult:
++        """Flush one batch to L2; delete from L1 only when fully durable.
++
++        Returns:
++            SUCCESS when every readable key was persisted (or none were
++            readable), FAILURE for an actual persistence failure, and
++            DEADLINE_EXHAUSTED when an emergency flush consumed its budget.
++        """
++        if not keys:
++            return _SyncFlushResult.SUCCESS
++
++        read_result = self._l1_manager.reserve_read(keys)
++        readable_keys: list[ObjectKey] = []
++        readable_objs = []
++        for key in keys:
++            entry = read_result.get(key)
++            if (
++                entry is not None
++                and entry[0] == L1Error.SUCCESS
++                and entry[1] is not None
++            ):
++                readable_keys.append(key)
++                readable_objs.append(entry[1])
++
++        flushed = not readable_keys
++        deadline_exhausted = False
++        if readable_keys:
++            try:
++                for (
++                    idx,
++                    adapter,
++                    supports_timeout,
++                ) in self._snapshot_l2_flush_adapters():
++                    sync_store = adapter.store_objects_sync
++                    try:
++                        if deadline is None:
++                            result = sync_store(readable_keys, readable_objs)
++                        else:
++                            remaining = deadline - time.monotonic()
++                            if remaining <= 0:
++                                deadline_exhausted = True
++                                break
++                            if not supports_timeout:
++                                logger.warning(
++                                    "Emergency L1 writeback skipped adapter %d: "
++                                    "store_objects_sync has no timeout contract",
++                                    idx,
++                                )
++                                continue
++                            result = sync_store(
++                                readable_keys,
++                                readable_objs,
++                                timeout=remaining,
++                            )
++                        ok, persisted_count, bytes_written = result
++                    except Exception:
++                        if deadline is not None and time.monotonic() >= deadline:
++                            deadline_exhausted = True
++                            break
++                        logger.exception(
++                            "L1-to-L2 flush: sync store failed on adapter %d", idx
++                        )
++                        continue
++                    if not ok and deadline is not None and time.monotonic() >= deadline:
++                        deadline_exhausted = True
++                        break
++                    # Never delete unless every readable key is durable.
++                    if ok and persisted_count == len(readable_keys):
++                        flushed = True
++                        logger.info(
++                            "L1-to-L2 flush: sync persisted %d/%d keys "
++                            "(%d bytes) via adapter %d",
++                            persisted_count,
++                            len(readable_keys),
++                            bytes_written,
++                            idx,
++                        )
++                        break
++                    logger.warning(
++                        "L1-to-L2 flush: adapter %d partial/failed persist "
++                        "(%d/%d keys, %d bytes)",
++                        idx,
++                        persisted_count,
++                        len(readable_keys),
++                        bytes_written,
++                    )
++            finally:
++                self._l1_manager.finish_read(readable_keys)
++
++        # Only keys we read and then fully persisted may be deleted. A key
++        # that failed reserve_read can have become locked after candidate
++        # selection and must never be treated as absent.
++        keys_to_delete = list(readable_keys) if flushed else []
++        if not flushed and readable_keys:
++            logger.warning(
++                "L1-to-L2 flush: preserving %d readable keys after failed persist",
++                len(readable_keys),
++            )
++
++        if keys_to_delete:
++            result = self._l1_manager.delete(keys_to_delete)
++            not_deleted = [k for k, err in result.items() if err != L1Error.SUCCESS]
++            if not_deleted:
++                logger.debug(
++                    "L1-to-L2 flush: %d keys not deleted, likely still locked",
++                    len(not_deleted),
++                )
++        if deadline_exhausted:
++            return _SyncFlushResult.DEADLINE_EXHAUSTED
++        if flushed:
++            return _SyncFlushResult.SUCCESS
++        return _SyncFlushResult.FAILURE
++
++    def _backup_to_l2_no_delete(self, batch_limit: int) -> None:
++        """Flush evictable L1 keys to L2 without deleting them from L1.
++
++        A backup, not an eviction: keys remain in L1 for fast access while
++        L2 gains a copy, so losing L1 (session expiry, restart) no longer
++        costs a cold prefill. A rotating cursor spreads repeated scans over
++        the whole L1 keyspace instead of hammering the first ``batch_limit``
++        insertion-ordered keys forever. Adapters skip keys they already
++        hold, so the flush is idempotent.
++        """
++        with self._flush_lock:
++            self._backup_to_l2_no_delete_locked(batch_limit)
++
++    def _backup_to_l2_no_delete_locked(self, batch_limit: int) -> None:
++        """Implementation of periodic backup under ``_flush_lock``."""
++        batch, self._backup_flush_cursor = self._l1_manager.get_evictable_keys(
++            limit=batch_limit,
++            cursor=self._backup_flush_cursor,
++        )
++        if not batch:
++            return
++
++        read_result = self._l1_manager.reserve_read(batch)
++        readable_keys: list[ObjectKey] = []
++        readable_objs = []
++        for key in batch:
++            entry = read_result.get(key)
++            if (
++                entry is not None
++                and entry[0] == L1Error.SUCCESS
++                and entry[1] is not None
++            ):
++                readable_keys.append(key)
++                readable_objs.append(entry[1])
++
++        if not readable_keys:
++            return
++
++        persisted_keys = 0
++        persisted_bytes = 0
++        try:
++            for idx, adapter, supports_timeout in self._snapshot_l2_flush_adapters():
++                if not supports_timeout:
++                    logger.warning(
++                        "Periodic L2 backup skipped adapter %d: "
++                        "store_objects_sync has no timeout contract",
++                        idx,
++                    )
++                    continue
++                sync_store = adapter.store_objects_sync
++                try:
++                    ok, persisted, written = sync_store(
++                        readable_keys,
++                        readable_objs,
++                        timeout=self._PERIODIC_FLUSH_TIMEOUT_SECONDS,
++                    )
++                    if ok and persisted == len(readable_keys):
++                        persisted_keys = persisted
++                        persisted_bytes = written
++                        break
++                except Exception:
++                    logger.exception("Periodic L2 backup: sync store failed on %d", idx)
++        finally:
++            self._l1_manager.finish_read(readable_keys)
++
++        if persisted_bytes > 0:
++            logger.info(
++                "Periodic L2 backup: persisted %d keys (%d new bytes, "
++                "%d evictable in L1, none deleted)",
++                persisted_keys,
++                persisted_bytes,
++                len(batch),
++            )
++
+ 
+ class L2AdapterEvictionState:
+     """Per-adapter eviction state: its own policy, listener, and config."""
+diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index 2138a33aa01ce95d7926bd4f6bcda79ae7d1955a..46239e518abaee70412223ec76eaa89f934a4bbe 100644
+--- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -55,6 +55,9 @@ from lmcache.v1.platform import (
+ 
+ if TYPE_CHECKING:
+     # First Party
++    from lmcache.v1.distributed.storage_controllers.eviction_controller import (
++        L1EvictionController,
++    )
+     from lmcache.v1.memory_management import MemoryObj
+ 
+ logger = init_logger(__name__)
+@@ -121,6 +124,17 @@ def trim_load_plan_with_mask(
+     return trimmed_plan
+ 
+ 
++def _layout_nbytes(layout_desc: MemoryLayoutDesc) -> int:
++    """Return the byte size of one object with the given layout."""
++    total = 0
++    for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True):
++        numel = 1
++        for dim in shape:
++            numel *= int(dim)
++        total += numel * dtype.itemsize
++    return total
++
++
+ # Poll timeout in milliseconds for the prefetch loop
+ PREFETCH_LOOP_POLL_TIMEOUT_MS = 500
+ 
+@@ -227,6 +241,11 @@ class PrefetchController(StorageControllerInterface):
+         self._policy = policy
+         self._max_in_flight = max_in_flight
+ 
++        # Optional L1 eviction controller for emergency make-room before
++        # large restores; injected by StorageManager when
++        # EvictionConfig.emergency_evict_for_prefetch is enabled.
++        self._l1_eviction_controller: "L1EvictionController | None" = None
++
+         # Adapters that are being drained and will be removed after all
+         # the in-flight operations are done.
+         self._draining: dict[int, threading.Event] = {}
+@@ -847,6 +866,25 @@ class PrefetchController(StorageControllerInterface):
+     # =========================================================================
+     # Load phase
+     # =========================================================================
++    def _select_l1_retentions(
++        self,
++        request_id: int,
++        keys: list[ObjectKey],
++    ) -> list[bool]:
++        """Return one retention decision per key, degrading safely on a
++        malformed policy result."""
++        retentions = self._policy.select_l1_retentions(keys)
++        if len(retentions) != len(keys):
++            logger.error(
++                "Prefetch request %d: policy returned %d retentions for "
++                "%d keys; defaulting to temporary entries",
++                request_id,
++                len(retentions),
++                len(keys),
++            )
++            return [False] * len(keys)
++        return retentions
++
+     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
+         """Compute load plan, reserve L1 buffers, and submit load tasks."""
+         request.phase = PrefetchPhase.PLAN_AND_LOAD
+@@ -899,15 +937,23 @@ class PrefetchController(StorageControllerInterface):
+         if request.mode is PrefetchMode.WARM:
+             retentions = [True] * len(keys_to_reserve)
+         else:
+-            retentions = self._policy.select_l1_retentions(
++            retentions = self._select_l1_retentions(
++                request.request_id,
+                 keys_to_reserve,
+             )
++            # Non-WARM only: a WARM warm-up must never trigger emergency
++            # eviction of other sessions' chunks.
++            self._make_room_for_restore(request, keys_to_reserve)
+         write_results = l1_mgr.reserve_write(
+             keys=keys_to_reserve,
+             is_temporary=[not r for r in retentions],
+             layout_desc=request.layout_desc,
+             mode="new",
+         )
++        if request.mode is not PrefetchMode.WARM:
++            write_results = self._retry_oom_reservations(
++                request, keys_to_reserve, retentions, write_results
++            )
+ 
+         # Step 4: filter to successfully reserved keys
+         reserved_key_set: set[ObjectKey] = set()
+@@ -1038,6 +1084,123 @@ class PrefetchController(StorageControllerInterface):
+             len(reserved_key_set),
+         )
+ 
++    def set_l1_eviction_controller(
++        self,
++        controller: "L1EvictionController | None",
++    ) -> None:
++        """Enable emergency L1 eviction for large restores.
++
++        With a controller injected, a non-WARM restore that would not fit
++        in free L1 space synchronously evicts LRU keys (write-back first)
++        before reserving, and retries OOM reservations once. Pass ``None``
++        after the last synchronous L2 adapter is removed to disable this path.
++        """
++        self._l1_eviction_controller = controller
++
++    # Never let a single restore claim more than this fraction of L1: a
++    # huge context must not wipe every hot chunk of the running sessions.
++    _EMERGENCY_EVICT_MAX_L1_FRACTION = 0.6
++    # Headroom per object for alignment and allocator bookkeeping.
++    _PER_OBJECT_HEADROOM_BYTES = 8192
++
++    def _make_room_for_restore(
++        self,
++        request: InFlightPrefetchRequest,
++        keys_to_reserve: list[ObjectKey],
++    ) -> None:
++        """Pre-evict LRU L1 chunks so the upcoming reserve_write for this
++        restore can succeed. No-op unless an eviction controller was
++        injected via ``set_l1_eviction_controller``."""
++        evictor = self._l1_eviction_controller
++        if evictor is None or not keys_to_reserve:
++            return
++        per_obj = _layout_nbytes(request.layout_desc)
++        if per_obj <= 0:
++            return
++        used, total = self._l1_manager.get_memory_usage()
++        need = (per_obj + self._PER_OBJECT_HEADROOM_BYTES) * len(keys_to_reserve)
++        need = min(need, int(total * self._EMERGENCY_EVICT_MAX_L1_FRACTION))
++        free = max(0, total - used)
++        if free >= need:
++            return
++        try:
++            evictor.emergency_evict_bytes(
++                need, requester=f"prefetch_request={request.request_id}"
++            )
++        except Exception:
++            logger.exception(
++                "Emergency eviction failed for prefetch request %d",
++                request.request_id,
++            )
++
++    def _retry_oom_reservations(
++        self,
++        request: InFlightPrefetchRequest,
++        keys_to_reserve: list[ObjectKey],
++        retentions: list[bool],
++        write_results: dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]],
++    ) -> dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]]:
++        """One retry round for keys whose reservation failed with
++        OUT_OF_MEMORY: evict the missing amount, reserve just those keys
++        again, and merge the results. No-op unless an eviction controller
++        was injected."""
++        evictor = self._l1_eviction_controller
++        if evictor is None:
++            return write_results
++        oom_keys: list[ObjectKey] = []
++        retention_by_key = dict(zip(keys_to_reserve, retentions, strict=True))
++        for key in keys_to_reserve:
++            entry = write_results.get(key)
++            if entry is None:
++                oom_keys.append(key)
++                continue
++            err, mem_obj = entry
++            if err == L1Error.OUT_OF_MEMORY or (
++                err == L1Error.SUCCESS and mem_obj is None
++            ):
++                oom_keys.append(key)
++        if not oom_keys:
++            return write_results
++        per_obj = _layout_nbytes(request.layout_desc)
++        if per_obj <= 0:
++            return write_results
++        _, total = self._l1_manager.get_memory_usage()
++        need = (per_obj + self._PER_OBJECT_HEADROOM_BYTES) * len(oom_keys)
++        need = min(need, int(total * self._EMERGENCY_EVICT_MAX_L1_FRACTION))
++        try:
++            evictor.emergency_evict_bytes(
++                need, requester=f"prefetch_request={request.request_id}/retry"
++            )
++        except Exception:
++            logger.exception(
++                "Emergency eviction retry failed for prefetch request %d",
++                request.request_id,
++            )
++            return write_results
++        retry_results = self._l1_manager.reserve_write(
++            keys=oom_keys,
++            is_temporary=[not retention_by_key[k] for k in oom_keys],
++            layout_desc=request.layout_desc,
++            mode="new",
++        )
++        recovered = sum(
++            1
++            for k in oom_keys
++            if retry_results.get(k)
++            and retry_results[k][0] == L1Error.SUCCESS
++            and retry_results[k][1] is not None
++        )
++        if recovered:
++            logger.info(
++                "Retry recovered %d/%d OOM reservations for prefetch request %d",
++                recovered,
++                len(oom_keys),
++                request.request_id,
++            )
++        merged = dict(write_results)
++        merged.update(retry_results)
++        return merged
++
+     def _update_lookup_results(
+         self, request_id: PrefetchRequestId, prefix_hit_count: int
+     ) -> None:
+@@ -1181,6 +1344,17 @@ class PrefetchController(StorageControllerInterface):
+         # added once the serde PR lands and adapters can distinguish
+         # deserialization errors from missing objects.
+         if failed_keys:
++            # These keys were reported present by the L2 lookup but the load
++            # returned no data. Sample a few so the on-disk state can be
++            # inspected post hoc.
++            logger.warning(
++                "Prefetch request %d: %d/%d plan keys failed to load from "
++                "L2 (lookup hit, load empty); sample: %s",
++                request.request_id,
++                len(failed_keys),
++                len(request.write_reserved_keys),
++                [str(k)[:160] for k in failed_keys[:3]],
++            )
+             self._event_bus.publish(
+                 Event(
+                     event_type=EventType.L2_PREFETCH_FAILED,
+diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
+index 3054e2441c5c7d98d817ca7a1f9ac30b4a7e92d7..a7da312a475264ddd1c829ad73937fc103cbf1a8 100644
+--- a/lmcache/v1/distributed/storage_manager.py
++++ b/lmcache/v1/distributed/storage_manager.py
+@@ -66,6 +66,7 @@ logger = init_logger(__name__)
+ 
+ class StorageManager:
+     def __init__(self, config: StorageManagerConfig):
++        self._eviction_config = config.eviction_config
+         self._l1_manager = L1Manager(config.l1_manager_config)
+         self._event_bus = get_event_bus()
+ 
+@@ -154,6 +155,31 @@ class StorageManager:
+         )
+         self._prefetch_controller.start()
+ 
++        # Opt-in L1 write-back tier: wire L2 adapters into the L1 eviction
++        # controller so evicted or periodically backed-up chunks are flushed
++        # to L2, and optionally let the prefetch controller trigger
++        # emergency eviction to make room for large restores.
++        eviction_config = config.eviction_config
++        wants_l1_write_back = (
++            eviction_config.write_back_on_evict
++            or eviction_config.periodic_flush_interval > 0
++        )
++        if wants_l1_write_back:
++            self._sync_l1_writeback_adapters()
++            if not self._eviction_controller.has_l2_flush_adapter():
++                logger.warning(
++                    "write_back_on_evict / periodic_flush_interval is set but "
++                    "no L2 adapter exposes store_objects_sync"
++                )
++        if (
++            eviction_config.emergency_evict_for_prefetch
++            and not self._eviction_controller.has_l2_flush_adapter()
++        ):
++            logger.warning(
++                "emergency_evict_for_prefetch has no synchronous L2 "
++                "adapter; inactive until one is added"
++            )
++
+         # L2 usage gauge — one observation per adapter, tagged by
+         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
+         register_gauge(
+@@ -904,6 +930,7 @@ class StorageManager:
+             with self._adapters_lock:
+                 self._l2_adapters[adapter_id] = adapter
+                 self._adapter_descriptors[adapter_id] = descriptor
++            self._sync_l1_writeback_adapters()
+             self._store_controller.add_adapter(adapter_id, adapter, descriptor)
+             self._prefetch_controller.add_adapter(adapter_id, adapter, descriptor)
+             if self._should_enable_l2_eviction(adapter, config.eviction_config):
+@@ -956,6 +983,9 @@ class StorageManager:
+             with self._adapters_lock:
+                 adapter = self._l2_adapters.pop(adapter_id)
+                 self._adapter_descriptors.pop(adapter_id, None)
++            # Waits for any synchronous L1 flush using the removed adapter
++            # before adapter.close() releases its native resources.
++            self._sync_l1_writeback_adapters()
+             adapter.close()
+             logger.info("Deleted L2 adapter %d", adapter_id)
+ 
+@@ -1121,6 +1151,21 @@ class StorageManager:
+             return False
+         return True
+ 
++    def _sync_l1_writeback_adapters(self) -> None:
++        """Publish the current adapter set to the optional L1 writeback tier."""
++        config = self._eviction_config
++        if not (config.write_back_on_evict or config.periodic_flush_interval > 0):
++            return
++        with self._adapters_lock:
++            adapters = dict(self._l2_adapters)
++        self._eviction_controller.set_l2_adapters(adapters)
++        if config.emergency_evict_for_prefetch:
++            self._prefetch_controller.set_l1_eviction_controller(
++                self._eviction_controller
++                if self._eviction_controller.has_l2_flush_adapter()
++                else None
++            )
++
+     def _unwrap_reconfigurable_l2_adapter(
+         self,
+         adapter: L2AdapterInterface,
+diff --git a/lmcache/v1/multiprocess/futures.py b/lmcache/v1/multiprocess/futures.py
+index beadae5505e4062d95b3e5f083d8e72b6bdf06d1..ab5195eec56aa3fcd9b52550aac52dc6133680b4 100644
+--- a/lmcache/v1/multiprocess/futures.py
++++ b/lmcache/v1/multiprocess/futures.py
+@@ -14,6 +14,7 @@ class MessagingFuture(Generic[T]):
+     def __init__(self):
+         self.is_done_ = threading.Event()
+         self.result_ = None
++        self.exception_: BaseException | None = None
+ 
+     def query(self) -> bool:
+         """
+@@ -54,6 +55,8 @@ class MessagingFuture(Generic[T]):
+         flag = self.wait(timeout)
+         if not flag:
+             raise LMCacheTimeoutError("Future result not available within timeout")
++        if self.exception_ is not None:
++            raise self.exception_
+         return self.result_
+ 
+     def set_result(self, result: T) -> None:
+@@ -68,6 +71,13 @@ class MessagingFuture(Generic[T]):
+         self.result_ = result
+         self.is_done_.set()
+ 
++    def set_exception(self, exception: BaseException) -> None:
++        """Complete the future with an exception from the messaging system."""
++        if not isinstance(exception, BaseException):
++            raise TypeError("exception must derive from BaseException")
++        self.exception_ = exception
++        self.is_done_.set()
++
+     def to_cuda_future(
+         self,
+         device: Any | None = None,
+diff --git a/lmcache/v1/multiprocess/mq.py b/lmcache/v1/multiprocess/mq.py
+index 271ff93b2a933f6c0f70f95a95d6f2249e7636c1..a5d0d0cf7322a523a9a8b89a0c5af2e2466109b1 100644
+--- a/lmcache/v1/multiprocess/mq.py
++++ b/lmcache/v1/multiprocess/mq.py
+@@ -40,6 +40,26 @@ T = TypeVar("T")
+ # Internal type used for the client-server communication
+ RequestUID = int
+ 
++_ERROR_RESPONSE_MARKER = b"LMCACHE_RPC_ERROR_V1"
++_MAX_REMOTE_ERROR_MESSAGE_BYTES = 4096
++
++
++class RemoteHandlerError(RuntimeError):
++    """A request handler failed in the remote LMCache process."""
++
++    def __init__(
++        self, request_type: RequestType, error_type: str, message: str
++    ) -> None:
++        self.request_type = request_type
++        self.error_type = error_type
++        self.remote_message = message
++        super().__init__(f"{request_type.name} handler failed: {error_type}: {message}")
++
++
++class _RemoteErrorPayload(msgspec.Struct, frozen=True):
++    error_type: str
++    message: str
++
+ 
+ # Helper functions
+ def encode_request_uid(uid: RequestUID) -> bytes:
+@@ -346,7 +366,28 @@ class MessageQueueClient:
+ 
+         if request_uid in self.pending_futures:
+             future = self.pending_futures.pop(request_uid)
+-            if b_response:
++            if b_response and b_response[0] == _ERROR_RESPONSE_MARKER:
++                if len(b_response) != 2:
++                    future.set_exception(
++                        RuntimeError("Malformed LMCache RPC error response")
++                    )
++                    return
++                try:
++                    error = msgspec_decode(b_response[1], cls=_RemoteErrorPayload)
++                except Exception:
++                    future.set_exception(
++                        RuntimeError("Failed to decode LMCache RPC error response")
++                    )
++                    logger.exception("Failed to decode RPC error response")
++                    return
++                future.set_exception(
++                    RemoteHandlerError(
++                        request_type=request_type,
++                        error_type=error.error_type,
++                        message=error.message,
++                    )
++                )
++            elif b_response:
+                 response = msgspec_decode(b_response[0], cls=response_cls)
+                 future.set_result(response)
+             else:
+@@ -516,6 +557,24 @@ class MessageQueueServer:
+         # Thread pools assigned via add_normal_thread_pool / add_affinity_thread_pool
+         self.extra_pools: list[ThreadPoolExecutor | AffinityThreadPool] = []
+ 
++    def _queue_error_response(
++        self, prefix_frames: list[bytes], exception: BaseException
++    ) -> None:
++        """Return a bounded error response without touching ZMQ off-thread."""
++        message = str(exception).encode("utf-8")[:_MAX_REMOTE_ERROR_MESSAGE_BYTES]
++        payload = _RemoteErrorPayload(
++            error_type=type(exception).__name__,
++            message=message.decode("utf-8", errors="replace"),
++        )
++        self.output_queue.put(
++            prefix_frames
++            + [
++                _ERROR_RESPONSE_MARKER,
++                msgspec_encode(payload, cls=_RemoteErrorPayload),
++            ]
++        )
++        self._output_efd.notify()
++
+     def _call_sync_handler(
+         self,
+         handler_entry: SyncRequestHandler[Any],
+@@ -571,8 +630,9 @@ class MessageQueueServer:
+                 self.output_queue.put(frames_to_send)
+                 self._output_efd.notify()
+ 
+-            except Exception:
++            except Exception as exc:
+                 logger.exception("Error in blocking handler")
++                self._queue_error_response(prefix_frames, exc)
+ 
+         future.add_done_callback(_notify_response)
+ 
+@@ -619,13 +679,23 @@ class MessageQueueServer:
+                             payloads=payloads,
+                             prefix_frames=[identity, b_request_uid, b_request_type],
+                         )
+-                    except Exception:
++                    except Exception as exc:
+                         logger.exception("Error handling request %s", request_type)
++                        self._queue_error_response(
++                            [identity, b_request_uid, b_request_type], exc
++                        )
+                 else:
+                     logger.error(
+                         "No handler registered for request type %s", request_type
+                     )
+                     logger.error("Available handlers: %s", list(self.handlers.keys()))
++                    self._queue_error_response(
++                        [identity, b_request_uid, b_request_type],
++                        RuntimeError(
++                            "No handler registered for request type "
++                            f"{request_type.name}"
++                        ),
++                    )
+ 
+             # Send the responses
+             if outbound_state and outbound_state & zmq.POLLIN:
+diff --git a/tests/v1/distributed/test_fs_native_startup_scan.py b/tests/v1/distributed/test_fs_native_startup_scan.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..796c27e183c9ff0bc923b4d5fbe7e7dfdb6957bc
+--- /dev/null
++++ b/tests/v1/distributed/test_fs_native_startup_scan.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Restart accounting for the native filesystem L2 adapter."""
++
++# Standard
++import os
++
++# Third Party
++import pytest
++
++# First Party
++from lmcache.v1.distributed.api import ObjectKey
++from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
++    _object_key_to_filename,
++)
++from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
++    _scan_existing_fs_native_files,
++)
++
++
++def _key(chunk_id: int) -> ObjectKey:
++    return ObjectKey(
++        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
++        model_name="test-model",
++        kv_rank=0,
++    )
++
++
++def _write(root, key: ObjectKey, size: int, mtime_ns: int) -> None:
++    path = root / _object_key_to_filename(key)
++    path.write_bytes(b"x" * size)
++    os.utime(path, ns=(mtime_ns, mtime_ns))
++
++
++def test_scan_returns_oldest_to_newest_keys_and_sizes(tmp_path):
++    newer = _key(2)
++    older = _key(1)
++    _write(tmp_path, newer, 200, 2_000_000_000)
++    _write(tmp_path, older, 100, 1_000_000_000)
++
++    keys, sizes = _scan_existing_fs_native_files(str(tmp_path))
++
++    assert keys == [older, newer]
++    assert sizes == [100, 200]
++
++
++def test_scan_skips_foreign_empty_and_temporary_files(tmp_path):
++    valid = _key(1)
++    _write(tmp_path, valid, 100, 1_000_000_000)
++    (tmp_path / "not-a-cache-file.data").write_bytes(b"x")
++    (tmp_path / _object_key_to_filename(_key(2))).write_bytes(b"")
++    (tmp_path / "pending.tmp").write_bytes(b"x")
++
++    keys, sizes = _scan_existing_fs_native_files(str(tmp_path))
++
++    assert keys == [valid]
++    assert sizes == [100]
++
++
++def test_scan_missing_directory_returns_empty(tmp_path):
++    assert _scan_existing_fs_native_files(str(tmp_path / "missing")) == ([], [])
++
++
++def test_scan_fails_closed_when_existing_file_cannot_be_inspected(
++    tmp_path, monkeypatch
++):
++    path = tmp_path / "broken.data"
++    path.write_bytes(b"x")
++    original_stat = type(path).stat
++
++    def fail_data_stat(self, *args, **kwargs):
++        if self == path:
++            raise OSError("injected stat failure")
++        return original_stat(self, *args, **kwargs)
++
++    monkeypatch.setattr(type(path), "stat", fail_data_stat)
++
++    with pytest.raises(RuntimeError, match="Could not inspect cache file"):
++        _scan_existing_fs_native_files(str(tmp_path))
+diff --git a/tests/v1/distributed/test_l1_manager.py b/tests/v1/distributed/test_l1_manager.py
+index fea845f903879a84856058ac107589a4b21e0fc7..5b0fb89bc77f4b274f8a27bc48c876aa3c7b54bb 100644
+--- a/tests/v1/distributed/test_l1_manager.py
++++ b/tests/v1/distributed/test_l1_manager.py
+@@ -132,18 +132,6 @@ def basic_layout():
+     )
+ 
+ 
+-@pytest.fixture
+-def large_layout():
+-    """Create a large MemoryLayoutDesc that will exhaust small memory.
+-
+-    Each allocation is 8MB (2M elements * 4 bytes).
+-    """
+-    return MemoryLayoutDesc(
+-        shapes=[torch.Size([2048, 1024])],  # 2M elements * 4 bytes = 8MB
+-        dtypes=[torch.float32],
+-    )
+-
+-
+ def make_object_key(chunk_hash: int, model_name: str = "test_model", kv_rank: int = 0):
+     """Helper to create ObjectKey instances."""
+     hash_bytes = ObjectKey.IntHash2Bytes(chunk_hash)
+@@ -879,14 +867,23 @@ class TestReserveWrite:
+ 
+         manager.close()
+ 
+-    def test_reserve_write_out_of_memory(self, small_l1_config, large_layout):
+-        """Test that reserve_write returns OUT_OF_MEMORY when allocation fails."""
++    def test_reserve_write_out_of_memory(self, small_l1_config):
++        """Test that reserve_write returns OUT_OF_MEMORY when allocation fails.
++
++        Uses an object larger than the whole pool; a batch that partially
++        fits allocates the longest prefix instead (see
++        tests/v1/distributed/test_l1_manager_partial_alloc.py).
++        """
+         manager = L1Manager(small_l1_config)
+         keys = [make_object_key(i) for i in range(10)]
+         is_temporary = [False] * 10
+ 
+-        # Request more memory than available (8MB * 10 = 80MB > 64MB)
+-        result = manager.reserve_write(keys, is_temporary, large_layout)
++        # A single object (128MB) exceeds the 64MB pool.
++        oversized_layout = MemoryLayoutDesc(
++            shapes=[torch.Size([2048 * 16, 1024])],
++            dtypes=[torch.float32],
++        )
++        result = manager.reserve_write(keys, is_temporary, oversized_layout)
+ 
+         # All keys should return OUT_OF_MEMORY
+         for key in keys:
+diff --git a/tests/v1/distributed/test_l1_manager_partial_alloc.py b/tests/v1/distributed/test_l1_manager_partial_alloc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..30ddc3fba0ce10c957ad6375874fac7df9cc8585
+--- /dev/null
++++ b/tests/v1/distributed/test_l1_manager_partial_alloc.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Partial-prefix allocation behavior of ``L1Manager.reserve_write``.
++
++A batch whose full allocation does not fit must not fail every key
++(all-or-nothing would collapse large L2->L1 restores to zero prefix hits):
++the longest prefix that fits is allocated and only the tail reports
++OUT_OF_MEMORY. Uses the CPU shared-memory allocator, no GPU required.
++"""
++
++# Standard
++from collections.abc import Iterator
++from types import SimpleNamespace
++
++# Third Party
++import pytest
++import torch
++
++# First Party
++from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
++from lmcache.v1.distributed.config import (
++    L1ManagerConfig,
++    L1MemoryManagerConfig,
++)
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.l1_manager import L1Manager
++
++POOL_BYTES = 64 * 1024 * 1024
++
++# 8MB per object: ten of them cannot fit in the 64MB pool, most can.
++OBJECT_LAYOUT = MemoryLayoutDesc(
++    shapes=[torch.Size([2048, 1024])],
++    dtypes=[torch.float32],
++)
++
++# A single 128MB object exceeds the whole pool.
++OVERSIZED_LAYOUT = MemoryLayoutDesc(
++    shapes=[torch.Size([2048 * 16, 1024])],
++    dtypes=[torch.float32],
++)
++
++
++@pytest.fixture
++def manager() -> Iterator[L1Manager]:
++    config = L1ManagerConfig(
++        memory_config=L1MemoryManagerConfig(
++            size_in_bytes=POOL_BYTES,
++            use_lazy=False,
++            init_size_in_bytes=POOL_BYTES,
++            align_bytes=0x1000,
++        ),
++        write_ttl_seconds=600,
++        read_ttl_seconds=300,
++    )
++    manager = L1Manager(config)
++    yield manager
++    manager.close()
++
++
++def _make_keys(count: int) -> list[ObjectKey]:
++    return [
++        ObjectKey(
++            chunk_hash=ObjectKey.IntHash2Bytes(i),
++            model_name="test_model",
++            kv_rank=0,
++        )
++        for i in range(count)
++    ]
++
++
++def test_reserve_write_allocates_longest_prefix_on_oom(manager: L1Manager) -> None:
++    """When the full batch does not fit, a non-empty prefix succeeds and
++    only the tail reports OUT_OF_MEMORY; every requested key keeps an
++    explicit per-key result."""
++    keys = _make_keys(10)
++    result = manager.reserve_write(keys, [False] * 10, OBJECT_LAYOUT)
++
++    assert set(result) == set(keys)
++    statuses = [result[key][0] for key in keys]
++    num_success = statuses.count(L1Error.SUCCESS)
++    assert 0 < num_success < 10
++
++    # The successful keys form a prefix in request order.
++    assert statuses == [L1Error.SUCCESS] * num_success + [L1Error.OUT_OF_MEMORY] * (
++        10 - num_success
++    )
++    for key in keys[:num_success]:
++        assert result[key][1] is not None
++    for key in keys[num_success:]:
++        assert result[key][1] is None
++
++
++def test_partial_prefix_is_committable(manager: L1Manager) -> None:
++    """The allocated prefix stays usable: finish_write succeeds for it."""
++    keys = _make_keys(10)
++    result = manager.reserve_write(keys, [False] * 10, OBJECT_LAYOUT)
++    successful = [key for key in keys if result[key][0] == L1Error.SUCCESS]
++    assert successful
++
++    finish_result = manager.finish_write(successful)
++    for key in successful:
++        assert finish_result[key] == L1Error.SUCCESS
++
++
++def test_reserve_write_all_oom_when_nothing_fits(manager: L1Manager) -> None:
++    """An object larger than the pool still fails every key."""
++    keys = _make_keys(3)
++    result = manager.reserve_write(keys, [False] * 3, OVERSIZED_LAYOUT)
++
++    for key in keys:
++        assert result[key][0] == L1Error.OUT_OF_MEMORY
++        assert result[key][1] is None
++
++
++def test_single_key_batch_keeps_all_or_nothing(manager: L1Manager) -> None:
++    """A one-key batch has no prefix to fall back to; it simply fails."""
++    keys = _make_keys(1)
++    result = manager.reserve_write(keys, [False], OVERSIZED_LAYOUT)
++
++    assert result[keys[0]] == (L1Error.OUT_OF_MEMORY, None)
++
++
++def test_largest_prefix_search_does_not_stop_at_a_smaller_fit() -> None:
++    """The OOM fallback finds the maximum, rather than accepting a midpoint."""
++
++    class BoundedMemoryManager:
++        def __init__(self, capacity: int) -> None:
++            self.capacity = capacity
++            self.allocate_counts: list[int] = []
++
++        def allocate(self, _layout: MemoryLayoutDesc, count: int):
++            self.allocate_counts.append(count)
++            if count > self.capacity:
++                return L1Error.OUT_OF_MEMORY, []
++            return L1Error.SUCCESS, [object() for _ in range(count)]
++
++        def free(self, _objects: list[object]) -> L1Error:
++            return L1Error.SUCCESS
++
++    memory_manager = BoundedMemoryManager(capacity=7)
++    manager = SimpleNamespace(_memory_manager=memory_manager)
++
++    err, objects = L1Manager._allocate_largest_prefix(
++        manager,
++        OBJECT_LAYOUT,
++        10,  # type: ignore[arg-type]
++    )
++
++    assert err == L1Error.SUCCESS
++    assert len(objects) == 7
++    assert memory_manager.allocate_counts[-1] == 7
++    assert 8 in memory_manager.allocate_counts
+diff --git a/tests/v1/distributed/test_l1_write_back_eviction.py b/tests/v1/distributed/test_l1_write_back_eviction.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b677516e37c31959421ea88f777a734d7f61bd0d
+--- /dev/null
++++ b/tests/v1/distributed/test_l1_write_back_eviction.py
+@@ -0,0 +1,609 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in L1 write-back tier.
++
++With ``EvictionConfig.write_back_on_evict`` enabled, L1 eviction flushes
++readable objects to L2 synchronously and deletes them from L1 only once
++every key in the batch is durable. ``periodic_flush_interval`` adds a
++below-watermark backup flush that keeps the L1 copy.
++``emergency_evict_for_prefetch`` lets the prefetch controller make room
++for large restores through the same write-back path.
++
++Uses the CPU shared-memory allocator; no GPU required.
++"""
++
++# Standard
++from collections.abc import Iterator
++import argparse
++import threading
++import time
++
++# Third Party
++import pytest
++import torch
++
++# First Party
++from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
++from lmcache.v1.distributed.config import (
++    EvictionConfig,
++    L1ManagerConfig,
++    L1MemoryManagerConfig,
++    StorageManagerConfig,
++    add_storage_manager_args,
++    parse_args_to_config,
++)
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.internal_api import (
++    EvictionAction,
++    EvictionDestination,
++)
++from lmcache.v1.distributed.l1_manager import L1Manager
++from lmcache.v1.distributed.storage_controllers.eviction_controller import (
++    L1EvictionController,
++)
++from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
++    InFlightPrefetchRequest,
++    PrefetchController,
++    PrefetchPhase,
++)
++from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
++    DefaultPrefetchPolicy,
++)
++from lmcache.v1.mp_observability.config import add_observability_args
++
++POOL_BYTES = 8 * 1024 * 1024
++
++# 1MB per object so a handful of objects create real memory pressure.
++OBJECT_LAYOUT = MemoryLayoutDesc(
++    shapes=[torch.Size([256, 1024])],
++    dtypes=[torch.float32],
++)
++
++
++class FakeSyncStoreAdapter:
++    """L2 adapter double exposing only the synchronous store path.
++
++    ``result`` overrides the returned tuple; by default every key is
++    reported durable.
++    """
++
++    def __init__(self) -> None:
++        self.stored_batches: list[list[ObjectKey]] = []
++        self.result: tuple[bool, int, int] | None = None
++
++    def store_objects_sync(
++        self,
++        keys: list[ObjectKey],
++        objects: list,
++        timeout: float | None = None,
++    ) -> tuple[bool, int, int]:
++        self.stored_batches.append(list(keys))
++        if self.result is not None:
++            return self.result
++        return True, len(keys), sum(obj.get_size() for obj in objects)
++
++
++class BlockingSyncStoreAdapter(FakeSyncStoreAdapter):
++    def __init__(self) -> None:
++        super().__init__()
++        self.entered = threading.Event()
++        self.release = threading.Event()
++
++    def store_objects_sync(self, keys, objects, timeout=None):
++        self.entered.set()
++        if not self.release.wait(timeout=timeout or 5.0):
++            return False, 0, 0
++        return super().store_objects_sync(keys, objects, timeout=timeout)
++
++
++@pytest.fixture
++def l1_manager() -> Iterator[L1Manager]:
++    config = L1ManagerConfig(
++        memory_config=L1MemoryManagerConfig(
++            size_in_bytes=POOL_BYTES,
++            use_lazy=False,
++            init_size_in_bytes=POOL_BYTES,
++            align_bytes=0x1000,
++        ),
++        write_ttl_seconds=600,
++        read_ttl_seconds=300,
++    )
++    manager = L1Manager(config)
++    yield manager
++    manager.close()
++
++
++def _make_controller(
++    l1_manager: L1Manager,
++    adapter: FakeSyncStoreAdapter,
++    **config_kwargs,
++) -> L1EvictionController:
++    config = EvictionConfig(eviction_policy="LRU", **config_kwargs)
++    return L1EvictionController(
++        l1_manager=l1_manager,
++        eviction_config=config,
++        l2_adapters={0: adapter},
++    )
++
++
++def _make_keys(count: int) -> list[ObjectKey]:
++    return [
++        ObjectKey(
++            chunk_hash=ObjectKey.IntHash2Bytes(i),
++            model_name="test_model",
++            kv_rank=0,
++        )
++        for i in range(count)
++    ]
++
++
++def _store_keys(l1_manager: L1Manager, keys: list[ObjectKey]) -> None:
++    result = l1_manager.reserve_write(keys, [False] * len(keys), OBJECT_LAYOUT)
++    for key in keys:
++        assert result[key][0] == L1Error.SUCCESS
++    l1_manager.finish_write(keys)
++
++
++def _readable_keys(l1_manager: L1Manager, keys: list[ObjectKey]) -> list[ObjectKey]:
++    result = l1_manager.reserve_read(keys)
++    readable = [
++        key
++        for key in keys
++        if result.get(key) is not None and result[key][0] == L1Error.SUCCESS
++    ]
++    if readable:
++        l1_manager.finish_read(readable)
++    return readable
++
++
++class TestWriteBackOnEvict:
++    def test_flush_then_delete(self, l1_manager):
++        """A durable flush deletes the batch from L1."""
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(3)
++        _store_keys(l1_manager, keys)
++
++        controller.execute_eviction_action(
++            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++        )
++
++        assert adapter.stored_batches == [keys]
++        assert _readable_keys(l1_manager, keys) == []
++
++    def test_failed_flush_preserves_l1(self, l1_manager):
++        """A failed flush keeps every readable key in L1 and opens the
++        circuit breaker."""
++        adapter = FakeSyncStoreAdapter()
++        adapter.result = (False, 0, 0)
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(3)
++        _store_keys(l1_manager, keys)
++
++        controller.execute_eviction_action(
++            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++        )
++
++        assert _readable_keys(l1_manager, keys) == keys
++        status = controller.report_status()
++        assert status["sync_flush_failures"] == 1
++        assert status["sync_flush_backoff_seconds"] > 0.0
++
++    def test_partial_flush_preserves_l1(self, l1_manager):
++        """A partial persist is not durable; the batch stays in L1."""
++        adapter = FakeSyncStoreAdapter()
++        adapter.result = (False, 2, 1024)
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(3)
++        _store_keys(l1_manager, keys)
++
++        controller.execute_eviction_action(
++            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++        )
++
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_missing_sync_adapter_fails_closed(self, l1_manager):
++        config = EvictionConfig(eviction_policy="LRU", write_back_on_evict=True)
++        controller = L1EvictionController(
++            l1_manager=l1_manager,
++            eviction_config=config,
++            l2_adapters={0: object()},
++        )
++        keys = _make_keys(2)
++        _store_keys(l1_manager, keys)
++
++        controller.execute_eviction_action(
++            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++        )
++
++        assert controller.has_l2_flush_adapter() is False
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_reserve_read_failure_is_not_deleted(self, l1_manager, monkeypatch):
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(1)
++        _store_keys(l1_manager, keys)
++        monkeypatch.setattr(
++            l1_manager,
++            "reserve_read",
++            lambda _keys: {keys[0]: (L1Error.KEY_IS_LOCKED, None)},
++        )
++
++        controller.execute_eviction_action(
++            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++        )
++
++        monkeypatch.undo()
++        assert adapter.stored_batches == []
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_adapter_replacement_waits_for_active_flush(self, l1_manager):
++        adapter = BlockingSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(1)
++        _store_keys(l1_manager, keys)
++        flush = threading.Thread(
++            target=lambda: controller.execute_eviction_action(
++                EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
++            )
++        )
++        replaced = threading.Event()
++        replace = threading.Thread(
++            target=lambda: (
++                controller.set_l2_adapters({}),
++                replaced.set(),
++            )
++        )
++
++        flush.start()
++        assert adapter.entered.wait(timeout=5.0)
++        replace.start()
++        time.sleep(0.05)
++        assert not replaced.is_set()
++
++        adapter.release.set()
++        flush.join(timeout=5.0)
++        replace.join(timeout=5.0)
++
++        assert replaced.is_set()
++        assert not flush.is_alive()
++        assert not replace.is_alive()
++
++
++class TestEmergencyEvict:
++    def test_emergency_evict_frees_bytes_via_write_back(self, l1_manager):
++        """emergency_evict_bytes flushes LRU victims to L2 and frees L1."""
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(6)
++        _store_keys(l1_manager, keys)
++
++        used_before, total = l1_manager.get_memory_usage()
++        free_before = total - used_before
++
++        free_after = controller.emergency_evict_bytes(
++            free_before + 2 * 1024 * 1024, requester="test"
++        )
++
++        assert free_after > free_before
++        assert adapter.stored_batches
++        evicted = [k for batch in adapter.stored_batches for k in batch]
++        assert set(evicted) <= set(keys)
++        assert len(evicted) < len(keys)
++        # Evicted keys are gone from L1.
++        assert not set(evicted) & set(_readable_keys(l1_manager, keys))
++
++    def test_emergency_evict_noop_when_enough_free(self, l1_manager):
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(2)
++        _store_keys(l1_manager, keys)
++
++        controller.emergency_evict_bytes(1024, requester="test")
++
++        assert adapter.stored_batches == []
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_emergency_evict_skips_scan_during_backoff(self, l1_manager, monkeypatch):
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        keys = _make_keys(6)
++        _store_keys(l1_manager, keys)
++        controller._sync_flush_backoff_until = time.monotonic() + 60
++        monkeypatch.setattr(
++            controller._eviction_policy,
++            "get_eviction_actions",
++            lambda *args, **kwargs: pytest.fail("eviction scan should be skipped"),
++        )
++
++        used, total = l1_manager.get_memory_usage()
++        free = total - used
++        assert controller.emergency_evict_bytes(free + 1024) == free
++
++    def test_emergency_evict_has_bounded_store_wait(self, l1_manager):
++        adapter = BlockingSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
++        controller._EMERGENCY_FLUSH_TIMEOUT_SECONDS = 0.05
++        keys = _make_keys(6)
++        _store_keys(l1_manager, keys)
++        used, total = l1_manager.get_memory_usage()
++
++        start = time.monotonic()
++        free_after = controller.emergency_evict_bytes(total - used + 1024)
++        elapsed = time.monotonic() - start
++
++        assert adapter.entered.is_set()
++        assert elapsed < 0.5
++        assert free_after == total - used
++        assert _readable_keys(l1_manager, keys) == keys
++        status = controller.report_status()
++        assert status["sync_flush_failures"] == 0
++        assert status["sync_flush_backoff_seconds"] == 0.0
++
++
++class TestPeriodicBackupFlush:
++    def test_backup_flush_keeps_l1_copy(self, l1_manager):
++        """The periodic backup flush copies keys to L2 without deleting
++        them from L1."""
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter, periodic_flush_interval=0.1)
++        keys = _make_keys(3)
++        _store_keys(l1_manager, keys)
++
++        controller.start()
++        try:
++            deadline = time.monotonic() + 5.0
++            while not adapter.stored_batches and time.monotonic() < deadline:
++                time.sleep(0.1)
++        finally:
++            controller.stop()
++
++        assert adapter.stored_batches
++        flushed = {k for batch in adapter.stored_batches for k in batch}
++        assert flushed <= set(keys)
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_backup_batches_rotate_without_full_snapshot(self, l1_manager):
++        adapter = FakeSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter)
++        keys = _make_keys(6)
++        _store_keys(l1_manager, keys)
++
++        for _ in range(3):
++            controller._backup_to_l2_no_delete(batch_limit=2)
++
++        assert [len(batch) for batch in adapter.stored_batches] == [2, 2, 2]
++        assert {key for batch in adapter.stored_batches for key in batch} == set(keys)
++
++    def test_backup_flush_has_bounded_store_wait(self, l1_manager):
++        adapter = BlockingSyncStoreAdapter()
++        controller = _make_controller(l1_manager, adapter)
++        controller._PERIODIC_FLUSH_TIMEOUT_SECONDS = 0.05
++        keys = _make_keys(2)
++        _store_keys(l1_manager, keys)
++
++        start = time.monotonic()
++        controller._backup_to_l2_no_delete(batch_limit=2)
++        elapsed = time.monotonic() - start
++
++        assert adapter.entered.is_set()
++        assert elapsed < 0.5
++        assert _readable_keys(l1_manager, keys) == keys
++
++    def test_evictable_batch_scan_wraps_and_is_bounded(self, l1_manager):
++        keys = _make_keys(5)
++        _store_keys(l1_manager, keys)
++        assert l1_manager.reserve_read([keys[0]])[keys[0]][0] == L1Error.SUCCESS
++        try:
++            first, cursor = l1_manager.get_evictable_keys(
++                limit=2,
++                cursor=0,
++                scan_limit=2,
++            )
++            second, cursor = l1_manager.get_evictable_keys(
++                limit=2,
++                cursor=cursor,
++                scan_limit=2,
++            )
++            third, _ = l1_manager.get_evictable_keys(
++                limit=2,
++                cursor=cursor,
++                scan_limit=2,
++            )
++        finally:
++            l1_manager.finish_read([keys[0]])
++
++        assert first == [keys[1]]
++        assert second == keys[2:4]
++        assert third == [keys[4]]
++
++
++class _RecordingEvictor:
++    """Eviction-controller double recording emergency_evict_bytes calls."""
++
++    def __init__(self) -> None:
++        self.calls: list[tuple[int, str]] = []
++
++    def emergency_evict_bytes(self, target_free_bytes: int, requester: str = "") -> int:
++        self.calls.append((target_free_bytes, requester))
++        return target_free_bytes
++
++
++@pytest.fixture
++def prefetch_controller(l1_manager: L1Manager) -> Iterator[PrefetchController]:
++    controller = PrefetchController(
++        l1_manager=l1_manager,
++        l2_adapters=[],
++        adapter_descriptors=[],
++        policy=DefaultPrefetchPolicy(),
++    )
++    yield controller
++    # The loop thread was never started, so stop() cannot join it.
++    controller._submission_efd.close()
++    controller._adapter_ctrl_efd.close()
++
++
++def _make_request(keys: list[ObjectKey]) -> InFlightPrefetchRequest:
++    return InFlightPrefetchRequest(
++        request_id=7,
++        keys=keys,
++        layout_desc=OBJECT_LAYOUT,
++        phase=PrefetchPhase.PLAN_AND_LOAD,
++    )
++
++
++class TestPrefetchMakeRoom:
++    def test_make_room_asks_evictor_when_short(self, l1_manager, prefetch_controller):
++        """A restore that does not fit in free L1 asks for eviction."""
++        controller = prefetch_controller
++        evictor = _RecordingEvictor()
++        controller.set_l1_eviction_controller(evictor)
++        resident = _make_keys(6)
++        _store_keys(l1_manager, resident)
++
++        restore_keys = [
++            ObjectKey(
++                chunk_hash=ObjectKey.IntHash2Bytes(100 + i),
++                model_name="test_model",
++                kv_rank=0,
++            )
++            for i in range(4)
++        ]
++        controller._make_room_for_restore(_make_request(restore_keys), restore_keys)
++
++        assert len(evictor.calls) == 1
++        target, requester = evictor.calls[0]
++        assert target > 0
++        assert "prefetch_request=7" in requester
++
++    def test_make_room_noop_when_space_available(self, l1_manager, prefetch_controller):
++        controller = prefetch_controller
++        evictor = _RecordingEvictor()
++        controller.set_l1_eviction_controller(evictor)
++
++        keys = _make_keys(2)
++        controller._make_room_for_restore(_make_request(keys), keys)
++
++        assert evictor.calls == []
++
++    def test_make_room_noop_without_evictor(self, l1_manager, prefetch_controller):
++        controller = prefetch_controller
++        keys = _make_keys(2)
++
++        controller._make_room_for_restore(_make_request(keys), keys)
++
++    def test_eviction_controller_can_be_disconnected(self, prefetch_controller):
++        evictor = _RecordingEvictor()
++        prefetch_controller.set_l1_eviction_controller(evictor)
++        prefetch_controller.set_l1_eviction_controller(None)
++
++        assert prefetch_controller._l1_eviction_controller is None
++
++    def test_short_retention_policy_degrades_to_temporary(
++        self, prefetch_controller, monkeypatch
++    ):
++        keys = _make_keys(3)
++        monkeypatch.setattr(
++            prefetch_controller._policy,
++            "select_l1_retentions",
++            lambda _keys: [True],
++        )
++
++        assert prefetch_controller._select_l1_retentions(7, keys) == [
++            False,
++            False,
++            False,
++        ]
++
++    def test_retry_recovers_oom_reservations(self, l1_manager, prefetch_controller):
++        """OOM reservations are retried once after emergency eviction."""
++        controller = prefetch_controller
++        evictor = _RecordingEvictor()
++        controller.set_l1_eviction_controller(evictor)
++        keys = _make_keys(2)
++        write_results = {key: (L1Error.OUT_OF_MEMORY, None) for key in keys}
++
++        merged = controller._retry_oom_reservations(
++            _make_request(keys), keys, [True, True], write_results
++        )
++
++        assert len(evictor.calls) == 1
++        for key in keys:
++            err, mem_obj = merged[key]
++            assert err == L1Error.SUCCESS
++            assert mem_obj is not None
++        l1_manager.finish_write(keys)
++
++    def test_retry_noop_when_all_reserved(self, l1_manager, prefetch_controller):
++        controller = prefetch_controller
++        evictor = _RecordingEvictor()
++        controller.set_l1_eviction_controller(evictor)
++        keys = _make_keys(2)
++        result = l1_manager.reserve_write(keys, [False, False], OBJECT_LAYOUT)
++
++        merged = controller._retry_oom_reservations(
++            _make_request(keys), keys, [True, True], result
++        )
++
++        assert evictor.calls == []
++        assert merged is result
++        l1_manager.finish_write(keys)
++
++
++class TestConfigPlumbing:
++    def test_parser_populates_write_back_fields(self):
++        parser = argparse.ArgumentParser()
++        add_storage_manager_args(parser)
++        add_observability_args(parser)
++        args = parser.parse_args(
++            [
++                "--l1-size-gb",
++                "1",
++                "--eviction-policy",
++                "LRU",
++                "--write-back-on-evict",
++                "--periodic-flush-interval",
++                "30.0",
++                "--emergency-evict-for-prefetch",
++            ]
++        )
++        config = parse_args_to_config(args)
++        assert config.eviction_config.write_back_on_evict is True
++        assert config.eviction_config.periodic_flush_interval == 30.0
++        assert config.eviction_config.emergency_evict_for_prefetch is True
++
++    def test_defaults_are_disabled(self):
++        parser = argparse.ArgumentParser()
++        add_storage_manager_args(parser)
++        add_observability_args(parser)
++        args = parser.parse_args(["--l1-size-gb", "1", "--eviction-policy", "LRU"])
++        config = parse_args_to_config(args)
++        assert config.eviction_config.write_back_on_evict is False
++        assert config.eviction_config.periodic_flush_interval == 0.0
++        assert config.eviction_config.emergency_evict_for_prefetch is False
++
++    @pytest.mark.parametrize(
++        "eviction_config",
++        [
++            EvictionConfig(
++                eviction_policy="LRU",
++                periodic_flush_interval=-1.0,
++            ),
++            EvictionConfig(
++                eviction_policy="LRU",
++                emergency_evict_for_prefetch=True,
++            ),
++        ],
++    )
++    def test_invalid_writeback_config_is_rejected(self, eviction_config):
++        with pytest.raises(ValueError):
++            StorageManagerConfig(
++                l1_manager_config=L1ManagerConfig(
++                    memory_config=L1MemoryManagerConfig(
++                        size_in_bytes=POOL_BYTES,
++                        use_lazy=False,
++                    )
++                ),
++                eviction_config=eviction_config,
++            )
+diff --git a/tests/v1/distributed/test_native_connector_l2_adapter.py b/tests/v1/distributed/test_native_connector_l2_adapter.py
+index dc16cdd1ae0161bf2306759cd2b72614a93c83fc..1f4348ad5e223aed6a96d25017a41c2b017a1126 100644
+--- a/tests/v1/distributed/test_native_connector_l2_adapter.py
++++ b/tests/v1/distributed/test_native_connector_l2_adapter.py
+@@ -10,6 +10,7 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
+ import ctypes
+ import select
+ import threading
++import time
+ 
+ # Third Party
+ import pytest
+@@ -56,6 +57,9 @@ class MockNativeConnector:
+         self._completions: list[tuple[int, bool, str, list[bool] | None]] = []
+         self._lock = threading.Lock()
+         self._closed = False
++        self.report_set_per_key_results = True
++        self.fail_set_keys: set[str] = set()
++        self.suppress_set_completion = False
+ 
+     def event_fd(self) -> int:
+         return self._efd.fileno()
+@@ -66,9 +70,21 @@ class MockNativeConnector:
+             self._next_id += 1
+ 
+         try:
++            results = []
+             for key, mv in zip(keys, memoryviews, strict=False):
++                if key in self.fail_set_keys:
++                    results.append(False)
++                    continue
+                 self._store[key] = bytes(mv)
+-            self._push_completion(fid, True, "", None)
++                results.append(True)
++            ok = all(results)
++            if not self.suppress_set_completion:
++                self._push_completion(
++                    fid,
++                    ok,
++                    "" if ok else "injected set failure",
++                    results if self.report_set_per_key_results else None,
++                )
+         except Exception as e:
+             self._push_completion(fid, False, str(e), None)
+ 
+@@ -155,6 +171,27 @@ class MockNativeConnector:
+             pass
+ 
+ 
++class DeferredExistsConnector(MockNativeConnector):
++    """Hold EXISTS completion to expose the submit-to-lock race window."""
++
++    def __init__(self):
++        super().__init__()
++        self.pending_exists: tuple[int, list[str]] | None = None
++
++    def submit_batch_exists(self, keys: list[str]) -> int:
++        with self._lock:
++            fid = self._next_id
++            self._next_id += 1
++        self.pending_exists = (fid, list(keys))
++        return fid
++
++    def complete_exists(self) -> None:
++        assert self.pending_exists is not None
++        fid, keys = self.pending_exists
++        self.pending_exists = None
++        self._push_completion(fid, True, "", [key in self._store for key in keys])
++
++
+ # =============================================================================
+ # Test Fixtures
+ # =============================================================================
+@@ -203,6 +240,14 @@ def adapter():
+     adp.close()
+ 
+ 
++@pytest.fixture
++def adapter_and_mock():
++    mock_client = MockNativeConnector()
++    adp = NativeConnectorL2Adapter(mock_client)
++    yield adp, mock_client
++    adp.close()
++
++
+ # =============================================================================
+ # ObjectKey Serialization Tests
+ # =============================================================================
+@@ -1182,6 +1227,91 @@ class TestDeleteInterface:
+     def test_delete_empty_keys(self, adapter):
+         adapter.delete([])  # should not raise
+ 
++    def test_delete_skips_lookup_locked_keys(self, adapter):
++        """Keys lookup-locked by an in-flight prefetch survive delete();
++        unlocked keys in the same batch are still deleted, and the locked
++        key becomes deletable again after unlock."""
++        keys = [create_object_key(i) for i in range(2)]
++        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
++        store_fd = adapter.get_store_event_fd()
++        lookup_fd = adapter.get_lookup_and_lock_event_fd()
++
++        adapter.submit_store_task(keys, objs)
++        wait_for_event_fd(store_fd, timeout=5.0)
++        adapter.pop_completed_store_tasks()
++
++        # An in-flight prefetch holds a lookup lock on keys[0].
++        task_id = adapter.submit_lookup_and_lock_task([keys[0]], _EMPTY_LAYOUT)
++        wait_for_event_fd(lookup_fd, timeout=5.0)
++        bitmap = adapter.query_lookup_and_lock_result(task_id)
++        assert bitmap.test(0) is True
++
++        adapter.delete(keys)
++
++        # keys[0] survived, keys[1] is gone. This lookup takes another
++        # lock on keys[0].
++        task_id = adapter.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
++        wait_for_event_fd(lookup_fd, timeout=5.0)
++        bitmap = adapter.query_lookup_and_lock_result(task_id)
++        assert bitmap.test(0) is True
++        assert bitmap.test(1) is False
++
++        # Release both locks; the key is deletable again.
++        adapter.submit_unlock([keys[0]])
++        adapter.submit_unlock([keys[0]])
++        adapter.delete([keys[0]])
++
++        task_id = adapter.submit_lookup_and_lock_task([keys[0]], _EMPTY_LAYOUT)
++        wait_for_event_fd(lookup_fd, timeout=5.0)
++        bitmap = adapter.query_lookup_and_lock_result(task_id)
++        assert bitmap.test(0) is False
++
++    def test_delete_all_keys_locked_is_noop(self, adapter):
++        """delete() returns without submitting when every key is locked."""
++        key = create_object_key(1)
++        obj = create_memory_obj()
++        store_fd = adapter.get_store_event_fd()
++        lookup_fd = adapter.get_lookup_and_lock_event_fd()
++
++        adapter.submit_store_task([key], [obj])
++        wait_for_event_fd(store_fd, timeout=5.0)
++        adapter.pop_completed_store_tasks()
++
++        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
++        wait_for_event_fd(lookup_fd, timeout=5.0)
++        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
++
++        adapter.delete([key])
++
++        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
++        wait_for_event_fd(lookup_fd, timeout=5.0)
++        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
++        adapter.submit_unlock([key])
++        adapter.submit_unlock([key])
++
++    def test_delete_skips_lookup_that_has_not_completed(self):
++        """Eviction cannot enter between lookup submission and lock acquire."""
++        client = DeferredExistsConnector()
++        adapter = NativeConnectorL2Adapter(client)
++        key = create_object_key(1)
++        obj = create_memory_obj()
++
++        try:
++            adapter.submit_store_task([key], [obj])
++            wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
++            adapter.pop_completed_store_tasks()
++
++            task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
++            adapter.delete([key])
++            assert _object_key_to_string(key) in client._store
++
++            client.complete_exists()
++            wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
++            assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
++            adapter.submit_unlock([key])
++        finally:
++            adapter.close()
++
+     def test_delete_batch(self, adapter):
+         keys = [create_object_key(i) for i in range(5)]
+         objs = [create_memory_obj(fill_value=float(i)) for i in range(5)]
+@@ -1294,7 +1424,6 @@ class TestUsageTracking:
+         # 400 bytes / 2000 bytes = 0.2
+         assert usage.usage_fraction == pytest.approx(0.2)
+         assert usage.total_bytes_used == 400
+-
+     def test_get_usage_after_delete(self, adapter_with_capacity):
+         adp = adapter_with_capacity
+         store_fd = adp.get_store_event_fd()
+@@ -1358,3 +1487,208 @@ class TestUsageTracking:
+         usage = adp.get_usage()
+         assert usage.usage_fraction == pytest.approx(0.2)
+         assert usage.total_bytes_used == 400
++
++    def test_inflight_stores_cannot_exceed_capacity(self):
++        mock_client = MockNativeConnector()
++        mock_client.suppress_set_completion = True
++        capacity = 800
++        adp = NativeConnectorL2Adapter(
++            mock_client,
++            max_capacity_gb=capacity / (1024**3),
++        )
++        try:
++            obj = create_memory_obj(size=100)  # 400 bytes
++            first = adp.submit_store_task([create_object_key(1)], [obj])
++            second = adp.submit_store_task([create_object_key(2)], [obj])
++            rejected = adp.submit_store_task([create_object_key(3)], [obj])
++
++            assert first != second != rejected
++            assert sum(len(value) for value in mock_client._store.values()) == capacity
++            assert adp.get_reserved_store_bytes() == capacity
++            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
++            result = adp.pop_completed_store_tasks()[rejected]
++            assert result.is_successful() is False
++            assert result.bytes_transferred() == 0
++        finally:
++            adp.close()
++
++    def test_failed_store_releases_capacity_reservation(self):
++        mock_client = MockNativeConnector()
++        capacity = 400
++        adp = NativeConnectorL2Adapter(
++            mock_client,
++            max_capacity_gb=capacity / (1024**3),
++        )
++        try:
++            first_key = create_object_key(1)
++            mock_client.fail_set_keys = {_object_key_to_string(first_key)}
++            first = adp.submit_store_task([first_key], [create_memory_obj(size=100)])
++            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
++            assert adp.pop_completed_store_tasks()[first].is_successful() is False
++            assert adp.get_reserved_store_bytes() == 0
++
++            mock_client.fail_set_keys.clear()
++            second = adp.submit_store_task(
++                [create_object_key(2)], [create_memory_obj(size=100)]
++            )
++            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
++            assert adp.pop_completed_store_tasks()[second].is_successful() is True
++            assert adp.get_usage().total_bytes_used == capacity
++        finally:
++            adp.close()
++
++    def test_synchronous_store_respects_capacity(self):
++        mock_client = MockNativeConnector()
++        capacity = 400
++        adp = NativeConnectorL2Adapter(
++            mock_client,
++            max_capacity_gb=capacity / (1024**3),
++        )
++        try:
++            first = adp.store_objects_sync(
++                [create_object_key(1)], [create_memory_obj(size=100)]
++            )
++            rejected = adp.store_objects_sync(
++                [create_object_key(2)], [create_memory_obj(size=100)]
++            )
++
++            assert first == (True, 1, capacity)
++            assert rejected == (False, 0, 0)
++            assert len(mock_client._store) == 1
++            assert adp.get_usage().total_bytes_used == capacity
++        finally:
++            adp.close()
++
++
++# =============================================================================
++# Durable Store Tests
++# =============================================================================
++
++
++class _BlockingStoreListener:
++    def __init__(self):
++        self.entered = threading.Event()
++        self.release = threading.Event()
++
++    def on_l2_keys_stored(self, keys, sizes) -> None:
++        self.entered.set()
++        assert self.release.wait(timeout=5.0)
++
++
++class TestStoreObjectsSync:
++    def test_success_uses_private_completion(self, adapter):
++        keys = [create_object_key(i) for i in range(2)]
++        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
++
++        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
++
++        assert ok is True
++        assert persisted == 2
++        assert bytes_written == sum(obj.get_size() for obj in objs)
++        assert adapter.get_usage().total_bytes_used == bytes_written
++        assert adapter.pop_completed_store_tasks() == {}
++
++    def test_partial_failure_accounts_only_persisted_keys(self, adapter_and_mock):
++        adapter, mock_client = adapter_and_mock
++        keys = [create_object_key(i) for i in range(2)]
++        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
++        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
++
++        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
++
++        assert ok is False
++        assert persisted == 1
++        assert bytes_written == objs[0].get_size()
++        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
++
++    def test_async_partial_failure_uses_per_key_results(self, adapter_and_mock):
++        adapter, mock_client = adapter_and_mock
++        keys = [create_object_key(i) for i in range(2)]
++        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
++        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
++
++        task_id = adapter.submit_store_task(keys, objs)
++        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
++
++        result = adapter.pop_completed_store_tasks()[task_id]
++        assert result.is_successful() is False
++        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
++
++    def test_batch_fallback_without_per_key_results(self, adapter_and_mock):
++        adapter, mock_client = adapter_and_mock
++        mock_client.report_set_per_key_results = False
++        keys = [create_object_key(i) for i in range(2)]
++        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
++
++        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
++
++        assert ok is True
++        assert persisted == 2
++        assert bytes_written == sum(obj.get_size() for obj in objs)
++
++    def test_validates_inputs(self, adapter):
++        with pytest.raises(ValueError, match="length mismatch"):
++            adapter.store_objects_sync([create_object_key(1)], [])
++        with pytest.raises(ValueError, match="timeout must be positive"):
++            adapter.store_objects_sync(
++                [create_object_key(1)], [create_memory_obj()], timeout=0
++            )
++        assert adapter.store_objects_sync([], []) == (True, 0, 0)
++
++    def test_real_timeout_keeps_pending_operation_reserved(self, adapter_and_mock):
++        adapter, mock_client = adapter_and_mock
++        mock_client.suppress_set_completion = True
++
++        result = adapter.store_objects_sync(
++            [create_object_key(1)], [create_memory_obj()], timeout=0.05
++        )
++
++        assert result == (False, 0, 0)
++        assert adapter._pending_sync_store_events == {}
++        assert len(adapter._pending_ops) == 1
++        assert adapter.get_reserved_store_bytes() == create_memory_obj().get_size()
++
++    def test_completion_at_timeout_does_not_wait_for_observer(self, adapter):
++        listener = _BlockingStoreListener()
++        adapter.register_listener(listener)
++        result = []
++        worker = threading.Thread(
++            target=lambda: result.append(
++                adapter.store_objects_sync(
++                    [create_object_key(1)],
++                    [create_memory_obj()],
++                    timeout=0.05,
++                )
++            )
++        )
++        worker.start()
++        assert listener.entered.wait(timeout=5.0)
++        time.sleep(0.1)
++        assert not worker.is_alive()
++        assert result[0][0] is True
++        assert adapter.get_usage().total_bytes_used == result[0][2]
++
++        listener.release.set()
++        worker.join(timeout=5.0)
++
++        assert not worker.is_alive()
++
++    def test_close_unblocks_waiter(self, adapter_and_mock):
++        adapter, mock_client = adapter_and_mock
++        mock_client.suppress_set_completion = True
++        result = []
++        worker = threading.Thread(
++            target=lambda: result.append(
++                adapter.store_objects_sync(
++                    [create_object_key(1)], [create_memory_obj()], timeout=10.0
++                )
++            )
++        )
++        worker.start()
++        time.sleep(0.05)
++
++        adapter.close()
++        worker.join(timeout=5.0)
++
++        assert not worker.is_alive()
++        assert result == [(False, 0, 0)]
+diff --git a/tests/v1/distributed/test_native_connector_restart_accounting.py b/tests/v1/distributed/test_native_connector_restart_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5d6c68c3fcb236bafd2bfdf9a2b8c9582e00d8
+--- /dev/null
++++ b/tests/v1/distributed/test_native_connector_restart_accounting.py
+@@ -0,0 +1,66 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Restart accounting behavior shared by native L2 connectors."""
++
++# Third Party
++import pytest
++
++# First Party
++from tests.v1.distributed.test_native_connector_l2_adapter import (
++    adapter,
++    create_object_key,
++)
++
++
++class _RecordingL2Listener:
++    def __init__(self):
++        self.stored = []
++
++    def on_l2_keys_stored(self, keys, sizes) -> None:
++        self.stored.append((list(keys), list(sizes)))
++
++
++class TestPrimeExistingKeys:
++    def test_priming_accounts_deduplicated_usage(self, adapter):
++        key = create_object_key(1)
++
++        adapter.prime_existing_keys([key, key], [100, 999])
++
++        assert adapter.get_usage().total_bytes_used == 100
++        assert adapter._key_sizes == {key: 100}
++
++    def test_first_listener_receives_startup_snapshot_once(self, adapter):
++        keys = [create_object_key(1), create_object_key(2)]
++        adapter.prime_existing_keys(keys, [100, 200])
++        first = _RecordingL2Listener()
++        second = _RecordingL2Listener()
++
++        adapter.register_listener(first)
++        adapter.register_listener(second)
++
++        assert first.stored == [(keys, [100, 200])]
++        assert second.stored == []
++        assert adapter.get_usage().total_bytes_used == 300
++
++    def test_empty_snapshot_is_consumed_without_callback(self, adapter):
++        adapter.prime_existing_keys([], [])
++        listener = _RecordingL2Listener()
++
++        adapter.register_listener(listener)
++
++        assert listener.stored == []
++
++    def test_rejects_invalid_or_repeated_priming(self, adapter):
++        with pytest.raises(ValueError, match="length mismatch"):
++            adapter.prime_existing_keys([create_object_key(1)], [1, 2])
++        with pytest.raises(ValueError, match="must be positive"):
++            adapter.prime_existing_keys([create_object_key(1)], [0])
++
++        adapter.prime_existing_keys([], [])
++        with pytest.raises(RuntimeError, match="already primed"):
++            adapter.prime_existing_keys([], [])
++
++    def test_rejects_priming_after_listener_registration(self, adapter):
++        adapter.register_listener(_RecordingL2Listener())
++
++        with pytest.raises(RuntimeError, match="before listeners"):
++            adapter.prime_existing_keys([], [])
+diff --git a/tests/v1/distributed/test_native_fs_connector_results.py b/tests/v1/distributed/test_native_fs_connector_results.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..458fcf0edfcf8a04ab13a4431248640e557cb8c3
+--- /dev/null
++++ b/tests/v1/distributed/test_native_fs_connector_results.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Native FS connector completion semantics.
++
++These tests exercise the compiled extension. They are skipped when the
++optional native FS module is not part of the test environment.
++"""
++
++# Standard
++import select
++import time
++
++# Third Party
++import pytest
++
++lmcache_fs = pytest.importorskip("lmcache.lmcache_fs")
++
++
++def _wait_for_completion(client, timeout: float = 5.0):
++    poller = select.poll()
++    poller.register(client.event_fd(), select.POLLIN)
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if poller.poll(50):
++            completions = client.drain_completions()
++            if completions:
++                return completions
++    raise AssertionError("native connector completion timed out")
++
++
++def test_batch_set_reports_partial_results_and_continues(tmp_path):
++    client = lmcache_fs.LMCacheFSClient(str(tmp_path), 1)
++    try:
++        buffers = [bytearray(b"first"), bytearray(b"bad"), bytearray(b"last")]
++        keys = [
++            "model@00000000@01",
++            "malformed-key",
++            "model@00000000@03",
++        ]
++
++        future_id = client.submit_batch_set(
++            keys,
++            [memoryview(buffer) for buffer in buffers],
++        )
++        completions = _wait_for_completion(client)
++
++        assert len(completions) == 1
++        completed_id, ok, error, results = completions[0]
++        assert completed_id == future_id
++        assert ok is False
++        assert "partially failed" in error
++        assert results == [True, False, True]
++        assert len(list(tmp_path.glob("*.data"))) == 2
++    finally:
++        client.close()
+diff --git a/tests/v1/distributed/test_native_fs_key_compatibility.py b/tests/v1/distributed/test_native_fs_key_compatibility.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d18fba4e8f8c662a3826f1a8182ac681ca9a0584
+--- /dev/null
++++ b/tests/v1/distributed/test_native_fs_key_compatibility.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++"""ObjectKey compatibility of the compiled native FS connector."""
++
++# Standard
++import select
++import time
++
++# Third Party
++import pytest
++
++lmcache_fs = pytest.importorskip("lmcache.lmcache_fs")
++
++
++def _wait_for_completion(client, timeout: float = 5.0):
++    poller = select.poll()
++    poller.register(client.event_fd(), select.POLLIN)
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if poller.poll(50):
++            completions = client.drain_completions()
++            if completions:
++                return completions[0]
++    raise AssertionError("native connector completion timed out")
++
++
++@pytest.mark.parametrize(
++    ("wire_key", "filename"),
++    [
++        ("model@00000000@aabb", "model@0x00000000@aabb.data"),
++        (
++            "model@00000000@aabb@salt",
++            "model@0x00000000@aabb@salt.data",
++        ),
++        (
++            "model@00000000@2@aabb",
++            "model@0x00000000@2@aabb.data",
++        ),
++        (
++            "model@00000000@2@aabb@salt",
++            "model@0x00000000@2@aabb@salt.data",
++        ),
++    ],
++)
++def test_legacy_and_current_key_shapes(wire_key, filename, tmp_path):
++    client = lmcache_fs.LMCacheFSClient(str(tmp_path), 1)
++    try:
++        payload = bytearray(b"payload")
++        future_id = client.submit_batch_set([wire_key], [memoryview(payload)])
++        completed_id, ok, error, _results = _wait_for_completion(client)
++
++        assert completed_id == future_id
++        assert ok, error
++        assert (tmp_path / filename).read_bytes() == payload
++    finally:
++        client.close()
+diff --git a/tests/v1/distributed/test_native_fs_odirect.py b/tests/v1/distributed/test_native_fs_odirect.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d5118eca102011208e580b447f3d034cb8afd13
+--- /dev/null
++++ b/tests/v1/distributed/test_native_fs_odirect.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++"""O_DIRECT behavior of the compiled native FS connector."""
++
++# Standard
++import ctypes
++import select
++import time
++
++# Third Party
++import pytest
++
++lmcache_fs = pytest.importorskip("lmcache.lmcache_fs")
++
++
++def _aligned_view(size: int, alignment: int = 4096):
++    storage = bytearray(size + alignment)
++    address = ctypes.addressof(ctypes.c_char.from_buffer(storage))
++    offset = (-address) % alignment
++    return storage, memoryview(storage)[offset : offset + size]
++
++
++def _wait_for_completion(client, timeout: float = 5.0):
++    poller = select.poll()
++    poller.register(client.event_fd(), select.POLLIN)
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if poller.poll(50):
++            completions = client.drain_completions()
++            if completions:
++                return completions[0]
++    raise AssertionError("native connector completion timed out")
++
++
++def test_odirect_falls_back_for_misaligned_buffer_address(tmp_path):
++    client = lmcache_fs.LMCacheFSClient(str(tmp_path), 1, "", True)
++    try:
++        payload_storage = bytearray(4097)
++        payload = memoryview(payload_storage)[1:]
++        payload[:] = b"x" * len(payload)
++        key = "model@00000000@01"
++
++        store_id = client.submit_batch_set([key], [payload])
++        completed_id, ok, error, _results = _wait_for_completion(client)
++        assert completed_id == store_id
++        assert ok, error
++
++        loaded_storage = bytearray(4097)
++        loaded = memoryview(loaded_storage)[1:]
++        load_id = client.submit_batch_get([key], [loaded])
++        completed_id, ok, error, results = _wait_for_completion(client)
++        assert completed_id == load_id
++        assert ok, error
++        assert results == [True]
++        assert loaded == payload
++    finally:
++        client.close()
++
++
++def test_odirect_falls_back_for_misaligned_readahead_split(tmp_path):
++    client = lmcache_fs.LMCacheFSClient(str(tmp_path), 1, "", True, 4095)
++    try:
++        payload_storage, payload = _aligned_view(8192)
++        payload[:] = b"x" * len(payload)
++        key = "model@00000000@02"
++
++        store_id = client.submit_batch_set([key], [payload])
++        completed_id, ok, error, _results = _wait_for_completion(client)
++        assert completed_id == store_id
++        assert ok, error
++
++        loaded_storage, loaded = _aligned_view(8192)
++        load_id = client.submit_batch_get([key], [loaded])
++        completed_id, ok, error, results = _wait_for_completion(client)
++        assert completed_id == load_id
++        assert ok, error
++        assert results == [True]
++        assert loaded == payload
++        del payload_storage, loaded_storage
++    finally:
++        client.close()
+diff --git a/tests/v1/distributed/test_prefetch_controller.py b/tests/v1/distributed/test_prefetch_controller.py
+index 09c06c5819646d20d65485ee446793a1a9a7f9d0..e86ac177a07f19f54bb6417858dea1d4ff116cfd 100644
+--- a/tests/v1/distributed/test_prefetch_controller.py
++++ b/tests/v1/distributed/test_prefetch_controller.py
+@@ -35,6 +35,9 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
+     MockL2Adapter,
+     MockL2AdapterConfig,
+ )
++from lmcache.v1.distributed.storage_controllers import (
++    prefetch_controller as prefetch_controller_module,
++)
+ from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+     PrefetchController,
+     build_trim_mask,
+@@ -363,7 +366,7 @@ class TestSingleAdapterPrefetch:
+         ctrl.stop()
+         adapter.close()
+ 
+-    def test_fault_inject_load_gap_segmented_vs_prefix(self, l1_manager):
++    def test_fault_inject_load_gap_segmented_vs_prefix(self, l1_manager, monkeypatch):
+         """fault_inject (load fails at index 2) drives the segmented path.
+ 
+         Lookup reports all 5 keys present; the *load* of index 2 fails (the L2
+@@ -371,6 +374,14 @@ class TestSingleAdapterPrefetch:
+         post-gap keys {0,1,3,4}; PREFIX truncates at the hole to {0,1}. Distinct
+         key ranges per policy keep the shared L1 from serving the second pass.
+         """
++        warning_messages: list[str] = []
++
++        def capture_warning(message, *args, **_kwargs):
++            warning_messages.append(message % args)
++
++        monkeypatch.setattr(
++            prefetch_controller_module.logger, "warning", capture_warning
++        )
+         layout = make_layout()
+         for base, trim, expected in (
+             (0, TrimPolicy.SEGMENTED_PREFIX, [0, 1, 3, 4]),
+@@ -402,6 +413,11 @@ class TestSingleAdapterPrefetch:
+             ctrl.stop()
+             fault.close()
+ 
++        assert any(
++            "1/5 plan keys failed to load from L2" in message and "sample:" in message
++            for message in warning_messages
++        )
++
+     def test_key0_missing(self, l1_manager):
+         """L2 has keys {1,2,3} but not 0 → prefix = 0, nothing loaded."""
+         adapter = make_adapter()
+diff --git a/tests/v1/multiprocess/test_futures.py b/tests/v1/multiprocess/test_futures.py
+index 53cf694bc5c29ee852c5511d2753b6a8a676511a..c9086609ec879d9ed6fcceab478da9c5c7117d49 100644
+--- a/tests/v1/multiprocess/test_futures.py
++++ b/tests/v1/multiprocess/test_futures.py
+@@ -173,6 +173,27 @@ def test_messaging_future_complex_type():
+     thread.join()
+ 
+ 
++def test_messaging_future_exception_is_re_raised():
++    """A remote messaging failure completes the future instead of hanging it."""
++    future = MessagingFuture[int]()
++    error = RuntimeError("remote operation failed")
++
++    future.set_exception(error)
++
++    assert future.query()
++    assert future.wait(timeout=0.1)
++    with pytest.raises(RuntimeError, match="remote operation failed") as exc_info:
++        future.result(timeout=0.1)
++    assert exc_info.value is error
++
++
++def test_messaging_future_rejects_non_exception():
++    future = MessagingFuture[int]()
++
++    with pytest.raises(TypeError, match="must derive from BaseException"):
++        future.set_exception("not an exception")  # type: ignore[arg-type]
++
++
+ # ==============================================================================
+ # CUDAMessagingFuture Tests
+ # ==============================================================================
+diff --git a/tests/v1/multiprocess/test_mq.py b/tests/v1/multiprocess/test_mq.py
+index 75ff9cd7a0630391f0515622e36e1f38fe243764..93ef515bfc0c3a66feda76720178b2dd140a7211 100644
+--- a/tests/v1/multiprocess/test_mq.py
++++ b/tests/v1/multiprocess/test_mq.py
+@@ -21,6 +21,7 @@ from lmcache.v1.multiprocess.mq import (
+     BlockingRequestHandler,
+     MessageQueueClient,
+     MessageQueueServer,
++    RemoteHandlerError,
+ )
+ from lmcache.v1.multiprocess.protocol import (
+     RequestType,
+@@ -683,6 +684,58 @@ def test_shared_loop_dispatch():
+         server.close()
+ 
+ 
++def test_sync_handler_failure_completes_future_and_loop_recovers():
++    context = zmq.Context.instance()
++    server = MessageQueueServer("tcp://127.0.0.1:16021", context)
++    add_handler_helper(
++        server, RequestType.NOOP, test_mq_handler_helpers.failing_noop_handler
++    )
++    server.start()
++    client = MessageQueueClient("tcp://127.0.0.1:16021", context)
++
++    try:
++        failed = client.submit_request(RequestType.NOOP, [])
++        with pytest.raises(
++            RemoteHandlerError, match="intentional sync handler failure"
++        ) as exc_info:
++            failed.result(timeout=2)
++        assert exc_info.value.request_type is RequestType.NOOP
++        assert exc_info.value.error_type == "ValueError"
++
++        server.add_sync_handler(
++            RequestType.NOOP, [], test_mq_handler_helpers.noop_handler
++        )
++        assert (
++            client.submit_request(RequestType.NOOP, []).result(timeout=2) == "NOOP_OK"
++        )
++    finally:
++        client.close()
++        server.close()
++
++
++def test_blocking_handler_failure_completes_future():
++    context = zmq.Context.instance()
++    server = MessageQueueServer("tcp://127.0.0.1:16022", context)
++    add_handler_helper(
++        server, RequestType.LOOKUP, test_mq_handler_helpers.failing_lookup_handler
++    )
++    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
++    server.start()
++    client = MessageQueueClient("tcp://127.0.0.1:16022", context)
++
++    try:
++        future = client.submit_request(RequestType.LOOKUP, [create_cache_key(1), 1])
++        with pytest.raises(
++            RemoteHandlerError, match="intentional blocking handler failure"
++        ) as exc_info:
++            future.result(timeout=2)
++        assert exc_info.value.request_type is RequestType.LOOKUP
++        assert exc_info.value.error_type == "OSError"
++    finally:
++        client.close()
++        server.close()
++
++
+ def test_shared_loop_recreate():
+     """
+     Test that closing all clients and creating new ones starts a fresh loop.
+diff --git a/tests/v1/multiprocess/test_mq_handler_helpers.py b/tests/v1/multiprocess/test_mq_handler_helpers.py
+index b1d65251d3fd0a615bc256fb483cf78a4a8ef16e..9837df531ef7414473af86834bc63afcb7f842c0 100644
+--- a/tests/v1/multiprocess/test_mq_handler_helpers.py
++++ b/tests/v1/multiprocess/test_mq_handler_helpers.py
+@@ -29,6 +29,11 @@ def noop_handler() -> str:
+     return "NOOP_OK"
+ 
+ 
++def failing_noop_handler() -> str:
++    """Raise a deterministic error for RPC error propagation tests."""
++    raise ValueError("intentional sync handler failure")
++
++
+ # ==============================================================================
+ # REGISTER_KV_CACHE Request Handlers
+ # ==============================================================================
+@@ -203,6 +208,12 @@ def lookup_handler(key: KeyType, tp_size: int) -> None:
+     assert isinstance(tp_size, int), f"Expected tp_size to be int, got {type(tp_size)}"
+ 
+ 
++def failing_lookup_handler(key: KeyType, tp_size: int) -> None:
++    """Raise a deterministic error from a blocking request handler."""
++    del key, tp_size
++    raise OSError("intentional blocking handler failure")
++
++
+ # ==============================================================================
+ # FREE_LOOKUP_LOCKS Request Handlers
+ # ==============================================================================
+diff --git a/tests/v1/test_vllm_mp_adapter.py b/tests/v1/test_vllm_mp_adapter.py
+index d64ca9ec7061a0714cba7c9c488e3fb0cef9179a..ddf180a64dd9e6b9d8f4af4114324bc927fbf12f 100644
+--- a/tests/v1/test_vllm_mp_adapter.py
++++ b/tests/v1/test_vllm_mp_adapter.py
+@@ -782,3 +782,65 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
+     assert len(contexts) == 3
+     assert adapter.transfer_ctx is contexts[2]
+     contexts[1].close.assert_not_called()
++
++
++def _finished_retrieve_future(result: object) -> MagicMock:
++    """Build a completed retrieve future; an Exception *result* makes
++    ``result()`` raise it."""
++    future = MagicMock(name="retrieve_future")
++    future.query.return_value = True
++    if isinstance(result, Exception):
++        future.result.side_effect = result
++    else:
++        future.result.return_value = result
++    return future
++
++
++def test_failed_retrieve_marks_blocks_invalid(fake_adapter) -> None:
++    """A retrieve the healthy server answers with ``result=False`` is
++    reported finished AND its block ids are surfaced through
++    ``get_block_ids_with_load_errors`` so the scheduler recomputes them
++    instead of decoding over never-written blocks."""
++    adapter, _send_mock, _ = fake_adapter
++    adapter.retrieve_futures["req-1"] = (
++        _finished_retrieve_future(False),
++        [3, 4, 5],
++    )
++
++    ret_stores, finished_retrieves = adapter.get_finished(set())
++
++    assert ret_stores == set()
++    assert finished_retrieves == {"req-1"}
++    assert adapter.get_block_ids_with_load_errors() == {3, 4, 5}
++    # The error set is consumed on read.
++    assert adapter.get_block_ids_with_load_errors() == set()
++    assert adapter.retrieve_failure_count == 1
++
++
++def test_raising_retrieve_future_contained_as_failure(fake_adapter) -> None:
++    """A retrieve future whose ``result()`` raises must not propagate out
++    of ``get_finished`` (that would kill the engine step); it lands on the
++    same failure path as ``result=False``."""
++    adapter, _send_mock, _ = fake_adapter
++    adapter.retrieve_futures["req-1"] = (
++        _finished_retrieve_future(RuntimeError("ipc receive failed")),
++        [7, 8],
++    )
++
++    _ret_stores, finished_retrieves = adapter.get_finished(set())
++
++    assert finished_retrieves == {"req-1"}
++    assert adapter.get_block_ids_with_load_errors() == {7, 8}
++    assert adapter.retrieve_failure_count == 1
++
++
++def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
++    """A successful retrieve reports no load errors."""
++    adapter, _send_mock, _ = fake_adapter
++    adapter.retrieve_futures["req-1"] = (_finished_retrieve_future(True), [1, 2])
++
++    _ret_stores, finished_retrieves = adapter.get_finished(set())
++
++    assert finished_retrieves == {"req-1"}
++    assert adapter.get_block_ids_with_load_errors() == set()
++    assert adapter.retrieve_failure_count == 0
+diff --git a/tests/v1/test_vllm_mp_connector_metadata.py b/tests/v1/test_vllm_mp_connector_metadata.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45d427bd561aed4dcc953eda04259e2854008e15
+--- /dev/null
++++ b/tests/v1/test_vllm_mp_connector_metadata.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Unit tests for ``LMCacheMPRequestMetadata.GetRetrieveMetadata``.
++
++The retrieve op must only be emitted when the tracker's allocated block ids
++actually cover the retrieve token range in every engine group:
++``slice_block_ids_per_group`` validates chunk alignment only, and its plain
++Python slice truncates silently, so an uncovered range would otherwise emit
++an op with too few block ids.
++"""
++
++# Standard
++from types import SimpleNamespace
++
++# Third Party
++import pytest
++
++# First Party
++from lmcache.integration.vllm.lmcache_mp_connector import (
++    LMCacheMPRequestMetadata,
++    LMCacheMPRequestState,
++    LMCacheMPRequestTracker,
++)
++
++CHUNK_TOKENS = 64
++
++
++def _tracker(
++    num_tokens: int,
++    lmcache_hit_tokens: int,
++    vllm_hit_tokens: int,
++    allocated_block_ids: dict[int, list[int]],
++) -> LMCacheMPRequestTracker:
++    """Build a tracker that is ready for retrieving over *num_tokens*."""
++    request = SimpleNamespace(
++        request_id="req-1",
++        cache_salt="",
++        all_token_ids=list(range(num_tokens)),
++    )
++    tracker = LMCacheMPRequestTracker(request)
++    tracker.num_lmcache_hit_tokens = lmcache_hit_tokens
++    tracker.num_vllm_hit_tokens = vllm_hit_tokens
++    tracker.allocated_block_ids = allocated_block_ids
++    tracker.state = LMCacheMPRequestState.WAITING_FOR_LOAD
++    return tracker
++
++
++@pytest.mark.parametrize(
++    ("group_tokens_per_block", "allocated_block_ids", "expected_block_ids"),
++    [
++        # Single group, plain geometry: 64 tokens / 16 tokens per block.
++        ([16], {0: [0, 1, 2, 3]}, [[0, 1, 2, 3]]),
++        # Single group, DCP-scaled: one manager block id covers 64 tokens.
++        ([64], {0: [5]}, [[5]]),
++        # Hybrid geometries: each group sliced by its own tokens-per-block.
++        ([16, 32], {0: [0, 1, 2, 3], 1: [10, 11]}, [[0, 1, 2, 3], [10, 11]]),
++        # Extra allocated blocks beyond the range are fine (and not emitted).
++        ([16], {0: [0, 1, 2, 3, 4, 5]}, [[0, 1, 2, 3]]),
++    ],
++)
++def test_retrieve_metadata_emitted_when_allocation_covers_range(
++    group_tokens_per_block: list[int],
++    allocated_block_ids: dict[int, list[int]],
++    expected_block_ids: list[list[int]],
++) -> None:
++    tracker = _tracker(
++        num_tokens=CHUNK_TOKENS,
++        lmcache_hit_tokens=CHUNK_TOKENS,
++        vllm_hit_tokens=0,
++        allocated_block_ids=allocated_block_ids,
++    )
++
++    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(
++        tracker, CHUNK_TOKENS, group_tokens_per_block
++    )
++
++    assert metadata is not None
++    assert metadata.direction == "RETRIEVE"
++    assert metadata.op.start == 0
++    assert metadata.op.end == CHUNK_TOKENS
++    assert metadata.op.block_ids == expected_block_ids
++
++
++@pytest.mark.parametrize(
++    ("group_tokens_per_block", "allocated_block_ids"),
++    [
++        # One block short in the only group.
++        ([16], {0: [0, 1, 2]}),
++        # DCP-scaled group with no allocation at all.
++        ([64], {0: []}),
++        # Group 0 covered, group 1 one block short.
++        ([16, 32], {0: [0, 1, 2, 3], 1: [10]}),
++        # Group key missing entirely (counts as zero blocks).
++        ([16, 16], {0: [0, 1, 2, 3]}),
++    ],
++)
++def test_retrieve_metadata_suppressed_when_allocation_short(
++    group_tokens_per_block: list[int],
++    allocated_block_ids: dict[int, list[int]],
++) -> None:
++    """Any engine group whose allocation does not cover the retrieve range
++    suppresses the op entirely: the request falls back to recompute instead
++    of retrieving over silently truncated block-id lists."""
++    tracker = _tracker(
++        num_tokens=CHUNK_TOKENS,
++        lmcache_hit_tokens=CHUNK_TOKENS,
++        vllm_hit_tokens=0,
++        allocated_block_ids=allocated_block_ids,
++    )
++
++    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(
++        tracker, CHUNK_TOKENS, group_tokens_per_block
++    )
++
++    assert metadata is None
++
++
++def test_retrieve_metadata_skip_tokens_preserved_on_emitted_op() -> None:
++    """vLLM-hit tokens inside the first chunk round the start down and are
++    carried as skip_first_n_tokens; coverage is still checked against the
++    chunk-aligned end."""
++    tracker = _tracker(
++        num_tokens=CHUNK_TOKENS,
++        lmcache_hit_tokens=CHUNK_TOKENS,
++        vllm_hit_tokens=16,
++        allocated_block_ids={0: [0, 1, 2, 3]},
++    )
++
++    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(tracker, CHUNK_TOKENS, [16])
++
++    assert metadata is not None
++    assert metadata.op.start == 0
++    assert metadata.op.end == CHUNK_TOKENS
++    assert metadata.op.skip_first_n_tokens == 16

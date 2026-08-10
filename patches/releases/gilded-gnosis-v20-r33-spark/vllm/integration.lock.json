@@ -1,0 +1,168 @@
+{
+ "base": {
+  "commit": "e2666d9a65f41fc376607531453cbd57c4c71016",
+  "ref": "refs/heads/dev/gilded-gnosis",
+  "repository": "https://github.com/local-inference-lab/vllm.git"
+ },
+ "manifest": {
+  "sha256": "2f1c3ddc252aec35269247491717f58b5af35c01038fd5dd9cf6648996ac98c1"
+ },
+ "name": "gilded-gnosis-v20-r33-spark",
+ "pull_requests": [
+  {
+   "disposition": "merged",
+   "head": "99bf3f13f13012b72d6d67e49572d686b45b2833",
+   "number": 145,
+   "ref": "refs/pull/145/head",
+   "title": "GLM-5.2 calibrated NVFP4 MLA KV outer scales"
+  },
+  {
+   "disposition": "merged",
+   "head": "48e9d0f75d96db61429cbe7fe4fccb96739c58d6",
+   "number": 256,
+   "ref": "refs/pull/256/head",
+   "title": "Preserve activation dtype for int32-packed MLA weights"
+  },
+  {
+   "disposition": "merged",
+   "head": "aa75b01c476ffb5fc728232546fe5c215e3728ec",
+   "number": 188,
+   "ref": "refs/pull/188/head",
+   "title": "Emit packed UE8M0 scales from compiled QuantFP8"
+  },
+  {
+   "disposition": "merged",
+   "head": "1a2b01f43fbc151239c437e918dfdc27681ce4e7",
+   "number": 229,
+   "ref": "refs/pull/229/head",
+   "title": "Harden compressed MLA cache, workspace, and verifier capacity contracts"
+  },
+  {
+   "disposition": "merged",
+   "head": "5f144274d6e092237f4f4f437b7e9d3aaa427157",
+   "number": 213,
+   "ref": "refs/pull/213/head",
+   "title": "Skip pre-KV V2 attention during FlashInfer autotune"
+  },
+  {
+   "disposition": "merged",
+   "head": "8d989f18c2845e514313e80f65b07087b09d6a67",
+   "number": 214,
+   "ref": "refs/pull/214/head",
+   "title": "Add DeepSeek-V4-Flash-0731 profile and native L1/L2 offload"
+  },
+  {
+   "disposition": "merged",
+   "head": "bde9a133774e38a54511696cef1ac10b16ef700b",
+   "number": 217,
+   "ref": "refs/pull/217/head",
+   "title": "Harden shared regions for native CPU KV offload"
+  },
+  {
+   "disposition": "merged",
+   "head": "3b89c7a113f92522aa07cc3271422c04e458d771",
+   "number": 218,
+   "ref": "refs/pull/218/head",
+   "title": "Align native SWA/MTP retention and shared-prefix tails"
+  },
+  {
+   "disposition": "merged",
+   "head": "5ec935796f0afa19e3d8e41888ecc51a6a637528",
+   "number": 228,
+   "ref": "refs/pull/228/head",
+   "title": "Consolidate EXL3 runtime and prewarm mixed-Trellis route packing"
+  },
+  {
+   "disposition": "merged",
+   "head": "9401f9d8916f3bdf34123d2d493a918b748c8132",
+   "number": 230,
+   "ref": "refs/pull/230/head",
+   "title": "Keep broadcast MHC pre behind the compile boundary"
+  },
+  {
+   "disposition": "merged",
+   "head": "eaf24cc15f313c4b15afabb3f902cfe17f19f28f",
+   "number": 234,
+   "ref": "refs/pull/234/head",
+   "title": "Guard persistent FlashInfer decode wrappers by planned query length"
+  },
+  {
+   "disposition": "merged",
+   "head": "54349f9ce6d32a68c7c736f2ac3ac597afd6e208",
+   "number": 235,
+   "ref": "refs/pull/235/head",
+   "title": "Align DeepSeek-V4-0731 reasoning and tool prompt contract"
+  },
+  {
+   "disposition": "merged",
+   "head": "9dbd6d00b0340da173b61affb961954090632dec",
+   "number": 245,
+   "ref": "refs/pull/245/head",
+   "title": "Build one-shard indexer query-split topology"
+  },
+  {
+   "disposition": "merged",
+   "head": "85bc9770c94394fb070f3f9311d68bcaca6a354d",
+   "number": 248,
+   "ref": "refs/pull/248/head",
+   "title": "Prewarm CuTe PCIe one-shot all-reduce before graph capture"
+  },
+  {
+   "disposition": "merged",
+   "head": "c66ce7327ee586e5b600b9d7e12db30e93e8ec96",
+   "number": 251,
+   "ref": "refs/pull/251/head",
+   "title": "Isolate B12X graph channels and capture DSpark context KV"
+  },
+  {
+   "disposition": "merged",
+   "head": "1772842af39788286634e168ef766e15add83869",
+   "number": 253,
+   "ref": "refs/pull/253/head",
+   "title": "Add FlashInfer PCIe IPC all-reduce backend"
+  },
+  {
+   "disposition": "merged",
+   "head": "e3317de2336fc84396d7541950542c79b62102ae",
+   "number": 252,
+   "ref": "refs/pull/252/head",
+   "title": "Defer native KV-offload finalization until the final store is built"
+  },
+  {
+   "disposition": "merged",
+   "head": "5d961ad9d2efaba40531e8e4542a6c193412898d",
+   "number": 254,
+   "ref": "refs/pull/254/head",
+   "title": "Harden native offload cleanup and bound filesystem storage"
+  },
+  {
+   "disposition": "merged",
+   "head": "d1b7bbeb78da068ab0a505bd09505f6637cddcd9",
+   "number": 255,
+   "ref": "refs/pull/255/head",
+   "title": "Register GG runtime controls consumed directly by backends"
+  }
+ ],
+ "result": {
+  "patch": "integration.patch",
+  "patch_sha256": "417f5e558453f80c5e9d4e0a1222995cfca46e5646323a55c9d50ba08cf3f7ef",
+  "tree": "28e8eaf154fb500295d5aa1d6437e7b7badf9702"
+ },
+ "schema_version": 1,
+ "spark_overlay": {
+  "derived_from": {
+   "release": "gilded-gnosis-v20-r33",
+   "integration_tree": "fa13d334a2962756f9f7e9b562deb85387359f42"
+  },
+  "overlay_files": [
+   "CMakeLists.txt (SM121 arch 12.1 in CUDA13 supported archs)",
+   "vllm/models/deepseek_v4/nvidia/model.py (3D-aware MTP residual fallback)",
+   "vllm/model_executor/layers/quantization/exl3.py (fail-closed online EXL3: guard at ONLINE MODE SELECTION in _online_trellis_bits, before cache identity/lookup, so cached artifacts are equally unusable; belt-and-braces loader guard retained; both require the literal \"1\" in VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE)",
+   "vllm/envs.py (register VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE so env validation recognizes the deliberate override)"
+  ],
+  "dropped_since_r28_spark": [
+   "flashinfer q_len guard: upstream composes our PR#234 head eaf24cc15 verbatim",
+   "EXL3 SKIPPED-marker loader guard: extension now ships for sm_121a (decode family proven exact)"
+  ]
+ }
+}
