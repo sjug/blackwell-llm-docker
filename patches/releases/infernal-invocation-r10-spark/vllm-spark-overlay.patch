@@ -1,0 +1,77 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9c01c92eb..ffa722a9d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,13 +117,13 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.4)
+   # Rubin (10.7) can run SM100 family code, but CUDA 13.4 also supports
+   # targeting it directly.
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0;12.1")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
+    # to support the whole generation without specifying all sub-architectures
+    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+diff --git a/vllm/envs.py b/vllm/envs.py
+index dbbd7534a..beb95d9dc 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -2397,6 +2397,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_EXL3_PREFILL_CAPACITY": lambda: os.getenv("VLLM_EXL3_PREFILL_CAPACITY"),
+     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
+     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
++    "VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE": lambda: os.getenv("VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE"),
+     "VLLM_EXL3_R7_A1_MIN_ROWS": lambda: os.getenv("VLLM_EXL3_R7_A1_MIN_ROWS"),
+     "VLLM_EXL3_R7_DEBUG": lambda: os.getenv("VLLM_EXL3_R7_DEBUG"),
+     "VLLM_EXL3_R7_FUSED": lambda: os.getenv("VLLM_EXL3_R7_FUSED"),
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 6dfca7159..481f07325 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -24,6 +24,7 @@ import dataclasses
+ import gc
+ import importlib
+ import os
++import platform
+ import sys
+ import zlib
+ from pathlib import Path
+@@ -194,6 +195,15 @@ def _online_trellis_bits() -> int | None:
+         raise ValueError(
+             f"VLLM_EXL3_ONLINE_TRELLIS_BITS must be from 3 to 8, got {bits}"
+         )
++    if platform.machine() == "aarch64" and os.environ.get(
++            "VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE") != "1":
++        raise RuntimeError(
++            "online EXL3 Trellis quantization is disabled in this build: "
++            "the ExLlamaV3 encoder fast path is unqualified on "
++            "SM121/aarch64 (exhaustive codebook oracle mismatch for the "
++            "3INST/MCG codebooks). Serve pre-quantized EXL3 checkpoints "
++            "with ONLINE_QUANT=none. VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE=1 "
++            "bypasses this guard at your own risk.")
+     return bits
+ 
+ 
+@@ -230,6 +240,16 @@ def _load_online_encoding_with_retry(
+ def _load_exl3_online_quantizer() -> Any:
+     """Load the encoder without importing ExLlamaV3's serving front end."""
+ 
++    if platform.machine() == "aarch64" and os.environ.get(
++            "VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE") != "1":
++        raise RuntimeError(
++            "online EXL3 Trellis quantization is disabled in this build: "
++            "the ExLlamaV3 encoder fast path is unqualified on "
++            "SM121/aarch64 (exhaustive codebook oracle mismatch for the "
++            "3INST/MCG codebooks). Serve pre-quantized EXL3 checkpoints "
++            "with ONLINE_QUANT=none. VLLM_EXL3_ONLINE_UNSAFE_OVERRIDE=1 "
++            "bypasses this guard at your own risk.")
++
+     global _EXL3_ONLINE_QUANTIZER
+     if _EXL3_ONLINE_QUANTIZER is not None:
+         return _EXL3_ONLINE_QUANTIZER

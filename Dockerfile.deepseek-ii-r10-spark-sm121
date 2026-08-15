@@ -1,0 +1,477 @@
+# syntax=docker/dockerfile:1.7
+
+# SPARK/SM121 variant of Dockerfile.deepseek-infernal-invocation-cu133-torch213.
+# Deltas: 12.1a/121a codegen everywhere, FlashInfer built at 12.1a (upstream's
+# own tools/spark recipe uses the same arch), the SM121 vLLM overlay applied
+# after canonical-tree verification, the ExLlamaV3 aarch64 arch-guard patch,
+# and no same-host NCCL policy baked into image env (cross-node RoCE serving
+# is runner-owned). buildah resolves ${VAR} against base-image ENV before
+# ARGs, so arch and version values are literals.
+
+ARG BASE_IMAGE=voipmonitor/vllm:kimi-k3-cu133-torch213-nccl2312-20260811-r2
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG BASE_IMAGE_ID
+ARG VLLM_REPO
+ARG VLLM_REF
+ARG VLLM_COMMIT
+ARG VLLM_PATCH_FILE
+ARG VLLM_PATCH_SHA256
+ARG VLLM_INTEGRATION_TREE
+ARG VLLM_INTEGRATION_LOCK_SHA256
+ARG VLLM_PRS
+ARG B12X_REPO
+ARG B12X_REF
+ARG B12X_COMMIT
+ARG B12X_PATCH_FILE
+ARG B12X_PATCH_SHA256
+ARG B12X_INTEGRATION_TREE
+ARG B12X_INTEGRATION_LOCK_SHA256
+ARG B12X_PRS
+ARG LMCACHE_REPO
+ARG LMCACHE_REF
+ARG LMCACHE_COMMIT
+ARG LMCACHE_PATCH_FILE
+ARG LMCACHE_PATCH_SHA256
+ARG LMCACHE_INTEGRATION_TREE
+ARG LMCACHE_INTEGRATION_LOCK_SHA256
+ARG LMCACHE_PRS
+ARG LMCACHE_BUILD_VERSION=0.5.2+glm52dcp.5
+ARG INSTANTTENSOR_REPO=https://github.com/voipmonitor/InstantTensor.git
+ARG INSTANTTENSOR_COMMIT=49b4010afc1cae0441e71fe0b0bffc24fa05e932
+ARG FLASHINFER_REPO=https://github.com/voipmonitor/flashinfer.git
+ARG FLASHINFER_REF=integration/main-pr4393-pcie-ipc-qualified-20260807
+ARG FLASHINFER_COMMIT=1ac6942776b383c6b03c7a5805a22e72a3e3349f
+ARG FLASHINFER_VERSION=0.6.18+cu133
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_COMMIT=a6b593d2826719dcf4892609af7b84ee23aaf32a
+ARG EXLLAMAV3_REPO=https://github.com/brandonmmusic-max/exllamav3.git
+ARG EXLLAMAV3_COMMIT=704aefd743b390af4bd0fb429d1906f9b964c7d8
+ARG EXLLAMAV3_PATCH_FILE=exllamav3-sm121-aarch64-guards-20260804.patch
+ARG EXLLAMAV3_PATCH_SHA256=e4ec12c6ad7bf5bb9ab2ab0f8e69c914f4265952cb89801f844d990be117a449
+ARG VLLM_SPARK_OVERLAY_FILE=releases/infernal-invocation-r10-spark/vllm-spark-overlay.patch
+ARG VLLM_SPARK_OVERLAY_SHA256
+ARG VLLM_SPARK_OVERLAY_TREE
+ARG CUTLASS_DSL_VERSION=4.6.2
+ARG VLLM_PACKAGE_VERSION
+ARG CACHE_FINGERPRINT
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:${PATH} \
+    PYTHONPATH=/opt/exllamav3:/opt/infernal-invocation/vllm:/opt/infernal-invocation/b12x \
+    SPARKINFER_DIR=/opt/infernal-invocation/b12x \
+    CUTLASS_DSL_VERSION=${CUTLASS_DSL_VERSION} \
+    TORCH_CUDA_ARCH_LIST=12.1a \
+    CMAKE_CUDA_ARCHITECTURES=121a \
+    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    FLASHINFER_LOCAL_VERSION=cu133 \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    NVCC_THREADS=4 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    VLLM_ENABLE_PCIE_ALLREDUCE=1 \
+    VLLM_PCIE_ALLREDUCE_BACKEND=cpp \
+    VLLM_CPP_AR_1STAGE_NCCL_CUTOFF=56KB \
+    VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS=0 \
+    VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
+
+ENV VLLM_EXL3_EXT_PATH=/opt/exllamav3 \
+    VLLM_EXL3_ENCODER_SOURCE=/opt/exllamav3-python/exllamav3 \
+    VLLM_EXL3_ENCODER_REVISION=${EXLLAMAV3_COMMIT} \
+    VLLM_EXL3_ONLINE_CACHE_DIR=/cache/exl3-online \
+    VLLM_EXL3_ONLINE_CACHE_MODE=readwrite
+
+ENV LOCAL_INFERENCE_CACHE_FINGERPRINT=${CACHE_FINGERPRINT} \
+    XDG_CACHE_HOME=/cache/jit/${CACHE_FINGERPRINT} \
+    VLLM_CACHE_ROOT=/cache/jit/${CACHE_FINGERPRINT}/vllm \
+    VLLM_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/vllm \
+    TRITON_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/triton \
+    TORCH_EXTENSIONS_DIR=/cache/jit/${CACHE_FINGERPRINT}/torch-extensions \
+    TORCHINDUCTOR_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/torchinductor \
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/flashinfer-autotune \
+    FLASHINFER_WORKSPACE_BASE=/cache/jit/${CACHE_FINGERPRINT}/flashinfer \
+    TVM_FFI_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tvm-ffi \
+    TVM_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tvm \
+    TILELANG_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/tilelang \
+    CUTE_DSL_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/cute-dsl \
+    B12X_CUTE_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/b12x/cute \
+    B12X_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/b12x/compile \
+    SPARKINFER_COMPILE_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/b12x/compile \
+    DG_JIT_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/deep-gemm \
+    MM_SPARSE_ATTN_AOT_CACHE=/cache/jit/${CACHE_FINGERPRINT}/minfer/mm-sparse-attn \
+    MINFER_FMHA_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/minfer/fmha-sm120 \
+    NUMBA_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/numba \
+    CUDA_CACHE_PATH=/cache/jit/${CACHE_FINGERPRINT}/cuda \
+    CUPY_CACHE_DIR=/cache/jit/${CACHE_FINGERPRINT}/cupy \
+    HF_HOME=/root/.cache/huggingface
+
+COPY patches /tmp/release-patches
+
+# Every source directory is reconstructed from a release lock. The resulting
+# Git tree is the runtime identity; a branch name alone is not sufficient.
+RUN set -eux; \
+    mkdir -p /opt/infernal-invocation; \
+    compose_source() { \
+      component="$1"; destination="$2"; repository="$3"; reference="$4"; \
+      commit="$5"; patch_file="$6"; patch_sha256="$7"; expected_tree="$8"; \
+      git clone --filter=blob:none --no-checkout "${repository}" "${destination}"; \
+      git -C "${destination}" fetch --filter=blob:none origin "${reference}"; \
+      git -C "${destination}" checkout --detach "${commit}"; \
+      test "$(git -C "${destination}" rev-parse HEAD)" = "${commit}"; \
+      patch_path="/tmp/release-patches/${patch_file}"; \
+      echo "${patch_sha256}  ${patch_path}" | sha256sum -c -; \
+      if test -s "${patch_path}"; then git -C "${destination}" apply "${patch_path}"; fi; \
+      git -C "${destination}" add -A; \
+      actual_tree="$(git -C "${destination}" write-tree)"; \
+      test "${actual_tree}" = "${expected_tree}" || { \
+        echo "${component} tree ${actual_tree} does not match ${expected_tree}" >&2; exit 1; \
+      }; \
+    }; \
+    compose_source vllm /opt/infernal-invocation/vllm \
+      "${VLLM_REPO}" "${VLLM_REF}" "${VLLM_COMMIT}" \
+      "${VLLM_PATCH_FILE}" "${VLLM_PATCH_SHA256}" "${VLLM_INTEGRATION_TREE}"; \
+    compose_source b12x /opt/infernal-invocation/b12x \
+      "${B12X_REPO}" "${B12X_REF}" "${B12X_COMMIT}" \
+      "${B12X_PATCH_FILE}" "${B12X_PATCH_SHA256}" "${B12X_INTEGRATION_TREE}"; \
+    compose_source lmcache /opt/infernal-invocation/lmcache \
+      "${LMCACHE_REPO}" "${LMCACHE_REF}" "${LMCACHE_COMMIT}" \
+      "${LMCACHE_PATCH_FILE}" "${LMCACHE_PATCH_SHA256}" "${LMCACHE_INTEGRATION_TREE}"; \
+    overlay_path="/tmp/release-patches/${VLLM_SPARK_OVERLAY_FILE}"; \
+    echo "${VLLM_SPARK_OVERLAY_SHA256}  ${overlay_path}" | sha256sum -c -; \
+    git -C /opt/infernal-invocation/vllm apply "${overlay_path}"; \
+    git -C /opt/infernal-invocation/vllm add -A; \
+    overlay_tree="$(git -C /opt/infernal-invocation/vllm write-tree)"; \
+    test "${overlay_tree}" = "${VLLM_SPARK_OVERLAY_TREE}" || { \
+      echo "spark overlay tree ${overlay_tree} does not match ${VLLM_SPARK_OVERLAY_TREE}" >&2; exit 1; \
+    }; \
+    rm -rf /tmp/release-patches
+
+# The arm64 NGC base exports CUTLASS_DSL_VERSION=4.5.2, which outranks the
+# ARG under buildah's expansion rules; the r10 contract is 4.6.2 and must be
+# a literal ENV. (Sole collision in the complete runtime-ARG/base-env audit.)
+ENV CUTLASS_DSL_VERSION=4.6.2
+
+# The virtual environment inherits CUDA, cuBLAS, cuDNN, NCCL, PyTorch,
+# Torchvision, XGrammar, and Transformers from the NVIDIA-derived base.
+RUN python -m pip uninstall --yes grpcio-tools nvidia-resiliency-ext \
+ && python -m venv --system-site-packages /opt/venv \
+ && grep -v '^torch==' /opt/infernal-invocation/vllm/requirements/build/cuda.txt \
+      > /tmp/vllm-build-without-torch.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+ && python -m pip install -r /tmp/vllm-build-without-torch.txt \
+ && python -m pip install -r /opt/infernal-invocation/vllm/requirements/common.txt \
+ && python -m pip install \
+      'numba==0.65.0' \
+      'fastsafetensors>=0.3.3' \
+      'nvidia-cudnn-frontend>=1.19.1' \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+      'cupy-cuda13x==13.6.0' \
+      'sortedcontainers==2.4.0' \
+      'aiofile==3.11.1' \
+      'aiofiles==25.1.0' \
+      'redis==8.0.1' \
+      'opentelemetry-exporter-prometheus==0.65b0' \
+      'pytest==8.4.1' \
+      'apache-tvm-ffi==0.1.11' \
+      'torch-c-dlpack-ext==0.1.5' \
+      'z3-solver==4.15.4.0' \
+      'tokenspeed-triton==3.8.10.post20260721' \
+ && python -m pip install --no-deps \
+      'quack-kernels==0.6.4' \
+      'humming-kernels[cu13]==0.1.12' \
+      'tilelang==0.1.12' \
+      'tokenspeed-mla==0.1.8' \
+ && python -m pip install --force-reinstall --no-deps \
+      "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+ && python -m pip check
+
+# FlashInfer provides sampling and the optional DeepSeek attention backend.
+# The source revision contains the qualified PCIe IPC collective integration.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --filter=blob:none --no-checkout "${FLASHINFER_REPO}" /tmp/flashinfer-src \
+ && git -C /tmp/flashinfer-src fetch --depth=1 origin "${FLASHINFER_COMMIT}" \
+ && git -C /tmp/flashinfer-src checkout --detach "${FLASHINFER_COMMIT}" \
+ && test "$(git -C /tmp/flashinfer-src rev-parse HEAD)" = "${FLASHINFER_COMMIT}" \
+ && git -C /tmp/flashinfer-src submodule update --init --recursive \
+ && python -m pip uninstall --yes flashinfer-python flashinfer-cubin flashinfer-jit-cache \
+ && cd /tmp/flashinfer-src \
+ && FLASHINFER_ENABLE_SM90=0 BUILD_NVEP=0 BUILD_NCCL_EP=0 BUILD_NIXL_EP=0 \
+      MAX_JOBS=20 python -m pip install --no-build-isolation --no-deps --force-reinstall . \
+ && MAX_JOBS=20 python -m pip wheel --no-build-isolation --no-deps \
+      -w /tmp/flashinfer-wheels ./flashinfer-jit-cache \
+ && python -m pip install --no-deps --force-reinstall \
+      /tmp/flashinfer-wheels/flashinfer_jit_cache-*.whl \
+ && test "$(python -c 'import importlib.metadata as m; print(m.version("flashinfer-python"))')" = \
+      "${FLASHINFER_VERSION}" \
+ && rm -rf /tmp/flashinfer-src /tmp/flashinfer-wheels
+
+# DeepGEMM is the qualified dense linear backend for DeepSeek W4A8 serving.
+RUN git clone --filter=blob:none --no-checkout "${DEEPGEMM_REPO}" /tmp/deepgemm-src \
+ && git -C /tmp/deepgemm-src fetch --depth=1 origin "${DEEPGEMM_COMMIT}" \
+ && git -C /tmp/deepgemm-src checkout --detach "${DEEPGEMM_COMMIT}" \
+ && test "$(git -C /tmp/deepgemm-src rev-parse HEAD)" = "${DEEPGEMM_COMMIT}" \
+ && git -C /tmp/deepgemm-src submodule update --init --recursive \
+ && cd /tmp/deepgemm-src \
+ && DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
+      python -m pip install --no-build-isolation --no-deps --force-reinstall . \
+ && rm -rf /tmp/deepgemm-src
+
+RUN python -m pip install --no-build-isolation --no-deps --force-reinstall \
+      /opt/infernal-invocation/b12x
+
+WORKDIR /opt/infernal-invocation/vllm
+
+# vLLM native extensions are compiled against the packaged PyTorch 2.13 ABI.
+RUN --mount=type=cache,id=deepseek-infernal-cu133-vllm-extensions,target=/tmp/vllm-extensions,sharing=locked \
+    set -eux; \
+    cmake -S . -B /tmp/vllm-extensions -G Ninja \
+      -U MARLIN_GEN_SCRIPT_HASH_AND_ARCH \
+      -U MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=75 \
+      -DVLLM_TARGET_DEVICE=cuda \
+      -DVLLM_PYTHON_EXECUTABLE=/opt/venv/bin/python \
+      -DNVCC_THREADS=4; \
+    cmake --build /tmp/vllm-extensions --parallel 20; \
+    cmake --install /tmp/vllm-extensions \
+      --prefix /tmp/vllm-flash-attn-python \
+      --component _vllm_fa4_cutedsl_C; \
+    test -f /tmp/vllm-flash-attn-python/vllm/vllm_flash_attn/cute/utils.py; \
+    cp -a /tmp/vllm-flash-attn-python/vllm/vllm_flash_attn/cute \
+      /opt/infernal-invocation/vllm/vllm/vllm_flash_attn/; \
+    find /tmp/vllm-extensions -name '*.abi3.so' > /tmp/vllm-extension-list; \
+    while IFS= read -r extension; do \
+      case "${extension}" in \
+        */vllm-flash-attn/*) destination=/opt/infernal-invocation/vllm/vllm/vllm_flash_attn ;; \
+        */_deps/*) continue ;; \
+        *) destination=/opt/infernal-invocation/vllm/vllm ;; \
+      esac; \
+      cp "${extension}" "${destination}/$(basename "${extension}")"; \
+    done < /tmp/vllm-extension-list; \
+    test -f /opt/infernal-invocation/vllm/vllm/_C_stable_libtorch.abi3.so; \
+    test -f /opt/infernal-invocation/vllm/vllm/cumem_allocator.abi3.so; \
+    test -f /opt/infernal-invocation/vllm/vllm/vllm_flash_attn/cute/utils.py
+
+ARG TRITON_KERNELS_REPO=https://github.com/triton-lang/triton.git
+ARG TRITON_KERNELS_COMMIT=0add68262ab0a2e33b84524346cb27cbb2787356
+
+RUN git clone --filter=blob:none --no-checkout "${TRITON_KERNELS_REPO}" /tmp/triton-kernels-src \
+ && git -C /tmp/triton-kernels-src fetch --depth=1 origin "${TRITON_KERNELS_COMMIT}" \
+ && git -C /tmp/triton-kernels-src checkout --detach "${TRITON_KERNELS_COMMIT}" \
+ && source_dir=/tmp/triton-kernels-src/python/triton_kernels/triton_kernels \
+ && destination=/opt/infernal-invocation/vllm/vllm/third_party/triton_kernels \
+ && test -f "${source_dir}/matmul_ogs.py" \
+ && mkdir -p "${destination}" \
+ && cp -a "${source_dir}/." "${destination}/" \
+ && site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+ && test ! -e "${site_packages}/triton_kernels" \
+ && ln -s "${destination}" "${site_packages}/triton_kernels" \
+ && rm -rf /tmp/triton-kernels-src
+
+# The Python package install supplies metadata, CLI entry points, and Rust
+# parsing binaries without replacing the native extension set above.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain none --no-modify-path \
+ && source /root/.cargo/env \
+ && rust_toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" \
+ && rustup toolchain install "${rust_toolchain}" \
+ && rustup default "${rust_toolchain}" \
+ && python tools/build_rust.py --release \
+ && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE="${VLLM_PACKAGE_VERSION}" \
+      VLLM_REQUIRE_RUST_FRONTEND=1 \
+      python -m pip install --no-build-isolation --no-deps --force-reinstall . \
+ && test "$(python -c 'import importlib.metadata as m; print(m.version("vllm"))')" = \
+      "${VLLM_PACKAGE_VERSION}" \
+ && rm -rf /root/.cargo /root/.rustup target rust/target
+
+# LMCache is built against the same PyTorch ABI and includes only RAM and
+# buffered filesystem dependencies in the serving runtime.
+RUN BUILD_WITH_CUDA=1 TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=20 \
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="${LMCACHE_BUILD_VERSION}" \
+      python -m pip wheel --no-build-isolation --no-deps \
+      -w /tmp/lmcache-wheels /opt/infernal-invocation/lmcache \
+ && python -m pip install --no-deps --force-reinstall /tmp/lmcache-wheels/lmcache-*.whl \
+ && test "$(python -c 'import importlib.metadata as m; print(m.version("lmcache"))')" = \
+      "${LMCACHE_BUILD_VERSION}"
+
+# The EXL3 checkpoint loader uses B12X kernels for rank-sliced inference. The
+# pinned ExLlamaV3 source and extension provide generic checkpoint parity and
+# the deterministic encoder used by the optional online K6 weight cache.
+COPY patches/${EXLLAMAV3_PATCH_FILE} /tmp/exllamav3-guards.patch
+RUN git clone --filter=blob:none --no-checkout \
+      "${EXLLAMAV3_REPO}" /tmp/exllamav3-src \
+ && git -C /tmp/exllamav3-src fetch --depth=1 origin "${EXLLAMAV3_COMMIT}" \
+ && git -C /tmp/exllamav3-src checkout --detach "${EXLLAMAV3_COMMIT}" \
+ && test "$(git -C /tmp/exllamav3-src rev-parse HEAD)" = "${EXLLAMAV3_COMMIT}" \
+ && echo "${EXLLAMAV3_PATCH_SHA256}  /tmp/exllamav3-guards.patch" | sha256sum -c - \
+ && git -C /tmp/exllamav3-src apply /tmp/exllamav3-guards.patch \
+ && cd /tmp/exllamav3-src \
+ && TORCH_CUDA_ARCH_LIST=12.1a MAX_JOBS=20 python setup.py build_ext --inplace \
+ && mapfile -t extensions < <(find . -maxdepth 1 -type f \
+      -name 'exllamav3_ext*.so' -print) \
+ && test "${#extensions[@]}" -eq 1 \
+ && test -f exllamav3/modules/quant/exl3_lib/quantize.py \
+ && install -d /opt/exllamav3 /opt/exllamav3-python \
+ && install -m 0755 "${extensions[0]}" /opt/exllamav3/ \
+ && cp -a exllamav3 /opt/exllamav3-python/ \
+ && VLLM_EXL3_EXT_PATH=/opt/exllamav3 python -c \
+      'import torch, importlib; assert hasattr(importlib.import_module("exllamav3_ext"), "exl3_gemm")' \
+ && rm -rf /tmp/exllamav3-src
+
+ARG INSTANTTENSOR_VERSION=0.1.9
+ARG INSTANTTENSOR_LIBAIO_REPO=https://github.com/1g4-mirror/libaio.git
+ARG INSTANTTENSOR_LIBAIO_COMMIT=1b18bfafc6a2f7b9fa2c6be77a95afed8b7be448
+ARG INSTANTTENSOR_LIBAIO_TREE=c9442e111b747e9329ea782c6edb9d13a827cc08
+ARG NCCL4PY_VERSION=0.3.1
+
+# InstantTensor supplies the distributed Safetensors loader required by the
+# DeepSeek launchers. The libaio mirror is pinned to the submodule object and
+# tree recorded by the InstantTensor source revision.
+RUN git clone --filter=blob:none --no-checkout \
+      "${INSTANTTENSOR_REPO}" /tmp/instanttensor-src \
+ && git -C /tmp/instanttensor-src fetch --depth=1 origin "${INSTANTTENSOR_COMMIT}" \
+ && git -C /tmp/instanttensor-src checkout --detach "${INSTANTTENSOR_COMMIT}" \
+ && test "$(git -C /tmp/instanttensor-src rev-parse HEAD)" = "${INSTANTTENSOR_COMMIT}" \
+ && test "$(git -C /tmp/instanttensor-src ls-tree HEAD \
+      csrc/third_party/libaio | awk '{print $3}')" = \
+      "${INSTANTTENSOR_LIBAIO_COMMIT}" \
+ && git -C /tmp/instanttensor-src config \
+      submodule.csrc/third_party/libaio.url "${INSTANTTENSOR_LIBAIO_REPO}" \
+ && git -C /tmp/instanttensor-src submodule update --init --recursive \
+ && test "$(git -C /tmp/instanttensor-src/csrc/third_party/libaio rev-parse HEAD)" = \
+      "${INSTANTTENSOR_LIBAIO_COMMIT}" \
+ && test "$(git -C /tmp/instanttensor-src/csrc/third_party/libaio \
+      rev-parse 'HEAD^{tree}')" = "${INSTANTTENSOR_LIBAIO_TREE}" \
+ && python -m pip install --no-build-isolation --no-deps \
+      --force-reinstall /tmp/instanttensor-src \
+ && test "$(python -c 'import importlib.metadata as m; print(m.version("instanttensor"))')" = \
+      "${INSTANTTENSOR_VERSION}" \
+ && rm -rf /tmp/instanttensor-src \
+ && python -m pip install --no-deps "nccl4py==${NCCL4PY_VERSION}"
+
+COPY launchers /tmp/runtime-launchers
+RUN for script in /opt/infernal-invocation/vllm/serve-*.sh; do \
+      if test -f "${script}"; then install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; fi; \
+    done \
+ && for script in /tmp/runtime-launchers/serve-*.sh \
+      /tmp/runtime-launchers/glm52-*.sh \
+      /tmp/runtime-launchers/lmcache-*.sh; do \
+      install -m 0755 "${script}" "/usr/local/bin/$(basename "${script}")"; \
+    done \
+ && if test -f /tmp/runtime-launchers/glm52-pcie-calibration.py; then \
+      install -m 0755 /tmp/runtime-launchers/glm52-pcie-calibration.py \
+        /usr/local/bin/glm52-pcie-calibration.py; \
+    fi \
+ && test -x /usr/local/bin/serve-ds4-flash.sh \
+ && test -x /usr/local/bin/serve-ds4-flash-spark.sh \
+ && test -x /usr/local/bin/serve-infernal-invocation.sh \
+ && test -x /usr/local/bin/serve-glm52-v19.sh \
+ && test -x /usr/local/bin/serve-glm52-hybrid-v19.sh \
+ && test -x /usr/local/bin/lmcache-mp-wrapper.sh \
+ && bash -n /usr/local/bin/serve-ds4-flash.sh \
+ && bash -n /usr/local/bin/serve-ds4-flash-spark.sh \
+ && bash -n /usr/local/bin/serve-infernal-invocation.sh \
+ && bash -n /usr/local/bin/serve-glm52-v19.sh \
+ && bash -n /usr/local/bin/lmcache-mp-wrapper.sh \
+ && rm -rf /tmp/runtime-launchers
+
+COPY tests/verify_deepseek_infernal_cu133_runtime.py /opt/local-inference/verify_deepseek_infernal_cu133_runtime.py
+COPY tests/deepseek-infernal-cu133-pip-check.allowlist /opt/local-inference/deepseek-infernal-cu133-pip-check.allowlist
+
+ARG XGRAMMAR_VERSION=0.2.5
+
+# LMCache's package metadata includes cloud and GPUDirect Storage backends that
+# are unsupported by this RAM and buffered-filesystem runtime. It also pins an
+# older telemetry stack than vLLM. Match the complete known metadata delta so
+# any additional missing or incompatible dependency still fails the build.
+RUN set -e; \
+    mkdir -p "/cache/jit/${CACHE_FINGERPRINT}"; \
+    python /opt/local-inference/verify_deepseek_infernal_cu133_runtime.py \
+      --vllm-version "${VLLM_PACKAGE_VERSION}" \
+      --flashinfer-version "${FLASHINFER_VERSION}" \
+      --lmcache-version "${LMCACHE_BUILD_VERSION}" \
+      --instanttensor-version "${INSTANTTENSOR_VERSION}" \
+      --cutlass-dsl-version "${CUTLASS_DSL_VERSION}" \
+      --xgrammar-version "${XGRAMMAR_VERSION}"; \
+    pip_status=0; \
+    python -m pip check > /tmp/pip-check.actual 2>&1 || pip_status=$?; \
+    test "${pip_status}" -eq 1; \
+    sort -o /tmp/pip-check.actual /tmp/pip-check.actual; \
+    sort /opt/local-inference/deepseek-infernal-cu133-pip-check.allowlist \
+      > /tmp/pip-check.expected; \
+    diff -u /tmp/pip-check.expected /tmp/pip-check.actual; \
+    rm -f /tmp/pip-check.actual /tmp/pip-check.expected
+
+ARG RELEASE_NAME
+ARG RELEASE_DATE
+ARG DOCKER_COMMIT
+
+LABEL org.opencontainers.image.title="Infernal Invocation CUDA 13.3 PyTorch 2.13 runtime" \
+      org.opencontainers.image.description="Source-locked DeepSeek-V4-Flash and GLM-5.2 runtime with B12X, LMCache, InstantTensor, and NCCL 2.31.2" \
+      org.opencontainers.image.source="https://github.com/local-inference-lab/blackwell-llm-docker" \
+      org.opencontainers.image.version="${RELEASE_DATE}" \
+      org.opencontainers.image.revision="${DOCKER_COMMIT}" \
+      local-inference.release.name="${RELEASE_NAME}" \
+      local-inference.docker.commit="${DOCKER_COMMIT}" \
+      local-inference.runtime.base-image="${BASE_IMAGE}" \
+      local-inference.runtime.base-id="${BASE_IMAGE_ID}" \
+      local-inference.cache.fingerprint="${CACHE_FINGERPRINT}" \
+      local-inference.vllm.repo="${VLLM_REPO}" \
+      local-inference.vllm.branch="${VLLM_REF}" \
+      local-inference.vllm.commit="${VLLM_COMMIT}" \
+      local-inference.vllm.integration.prs="${VLLM_PRS}" \
+      local-inference.vllm.integration.tree="${VLLM_INTEGRATION_TREE}" \
+      local-inference.vllm.patch_sha256="${VLLM_PATCH_SHA256}" \
+      local-inference.vllm.integration.lock_sha256="${VLLM_INTEGRATION_LOCK_SHA256}" \
+      local-inference.vllm.package-version="${VLLM_PACKAGE_VERSION}" \
+      local-inference.b12x.repo="${B12X_REPO}" \
+      local-inference.b12x.branch="${B12X_REF}" \
+      local-inference.b12x.commit="${B12X_COMMIT}" \
+      local-inference.b12x.integration.prs="${B12X_PRS}" \
+      local-inference.b12x.integration.tree="${B12X_INTEGRATION_TREE}" \
+      local-inference.b12x.patch_sha256="${B12X_PATCH_SHA256}" \
+      local-inference.b12x.integration.lock_sha256="${B12X_INTEGRATION_LOCK_SHA256}" \
+      local-inference.lmcache.repo="${LMCACHE_REPO}" \
+      local-inference.lmcache.ref="${LMCACHE_REF}" \
+      local-inference.lmcache.commit="${LMCACHE_COMMIT}" \
+      local-inference.lmcache.integration.prs="${LMCACHE_PRS}" \
+      local-inference.lmcache.integration.tree="${LMCACHE_INTEGRATION_TREE}" \
+      local-inference.lmcache.patch_sha256="${LMCACHE_PATCH_SHA256}" \
+      local-inference.lmcache.integration.lock_sha256="${LMCACHE_INTEGRATION_LOCK_SHA256}" \
+      local-inference.lmcache.version="${LMCACHE_BUILD_VERSION}" \
+      local-inference.instanttensor.repo="${INSTANTTENSOR_REPO}" \
+      local-inference.instanttensor.commit="${INSTANTTENSOR_COMMIT}" \
+      local-inference.instanttensor.version="${INSTANTTENSOR_VERSION}" \
+      local-inference.instanttensor.libaio.repo="${INSTANTTENSOR_LIBAIO_REPO}" \
+      local-inference.instanttensor.libaio.commit="${INSTANTTENSOR_LIBAIO_COMMIT}" \
+      local-inference.instanttensor.libaio.tree="${INSTANTTENSOR_LIBAIO_TREE}" \
+      local-inference.flashinfer.repo="${FLASHINFER_REPO}" \
+      local-inference.flashinfer.commit="${FLASHINFER_COMMIT}" \
+      local-inference.flashinfer.version="${FLASHINFER_VERSION}" \
+      local-inference.deepgemm.repo="${DEEPGEMM_REPO}" \
+      local-inference.deepgemm.commit="${DEEPGEMM_COMMIT}" \
+      local-inference.exllamav3.repo="${EXLLAMAV3_REPO}" \
+      local-inference.exllamav3.commit="${EXLLAMAV3_COMMIT}" \
+      local-inference.exllamav3.patch_file="${EXLLAMAV3_PATCH_FILE}" \
+      local-inference.exllamav3.patch_sha256="${EXLLAMAV3_PATCH_SHA256}" \
+      local-inference.vllm.spark-overlay.file="${VLLM_SPARK_OVERLAY_FILE}" \
+      local-inference.vllm.spark-overlay.sha256="${VLLM_SPARK_OVERLAY_SHA256}" \
+      local-inference.vllm.spark-overlay.tree="${VLLM_SPARK_OVERLAY_TREE}" \
+      local-inference.cutlass-dsl.version="${CUTLASS_DSL_VERSION}" \
+      local-inference.xgrammar.version="${XGRAMMAR_VERSION}" \
+      local-inference.cuda.version="13.3" \
+      local-inference.torch.version="2.13.0" \
+      local-inference.nccl.version="2.31.2" \
+      local-inference.nccl4py.version="${NCCL4PY_VERSION}"
+
+ENV NCCL_VERSION=2.31.2 \
+    NCCL_NET_PLUGIN=none \
+    NCCL_TUNER_PLUGIN=none
+
+WORKDIR /
+ENTRYPOINT ["/usr/local/bin/lmcache-mp-wrapper.sh", "/usr/local/bin/serve-ds4-flash.sh"]

@@ -1,0 +1,183 @@
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/avx2_target.cpp b/exllamav3/exllamav3_ext/avx2_target.cpp
+--- a/exllamav3/exllamav3_ext/avx2_target.cpp	2026-08-09 08:37:27.775650338 -0400
++++ b/exllamav3/exllamav3_ext/avx2_target.cpp	2026-08-04 13:53:13.937539489 -0400
+@@ -2,6 +2,9 @@
+ 
+ bool is_avx2_supported()
+ {
++#if !EXL3_X86
++    return false;
++#else
+     static bool avx2_check = false;
+     static bool avx2_supported = false;
+     if (avx2_check) return avx2_supported;
+@@ -16,4 +19,5 @@
+     // if (avx2_supported) printf("AVX2 supported\n");
+     // else printf("AVX2 not supported\n");
+     return avx2_supported;
++#endif
+ }
+\ No newline at end of file
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/avx2_target.h b/exllamav3/exllamav3_ext/avx2_target.h
+--- a/exllamav3/exllamav3_ext/avx2_target.h	2026-08-09 08:37:27.775650338 -0400
++++ b/exllamav3/exllamav3_ext/avx2_target.h	2026-08-04 13:52:56.404332285 -0400
+@@ -1,15 +1,25 @@
+ #pragma once
+ 
+-#ifndef __linux__
++// x86-only CPU feature targeting. On non-x86 hosts (e.g. aarch64 GB10 /
++// DGX Spark) the AVX translation units compile to stubs, is_avx2_supported()
++// returns false, and the native TP CPU-reduce backend fails closed at its
++// existing runtime check in all_reduce_cpu.cu.
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
++    #define EXL3_X86 1
++#else
++    #define EXL3_X86 0
++#endif
++
++#if EXL3_X86 && !defined(__linux__)
+     #include <intrin.h>
+ #endif
+ 
+ bool is_avx2_supported();
+ 
+-#ifdef __linux__
++#if EXL3_X86 && defined(__linux__)
+     #define AVX2_TARGET __attribute__((target("avx2")))
+     #define AVX2_TARGET_OPTIONAL __attribute__((target_clones("avx2","default")))
+ #else
+     #define AVX2_TARGET
+     #define AVX2_TARGET_OPTIONAL
+-#endif
+\ No newline at end of file
++#endif
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/avx512_target.cpp b/exllamav3/exllamav3_ext/avx512_target.cpp
+--- a/exllamav3/exllamav3_ext/avx512_target.cpp	2026-08-09 08:37:27.775650338 -0400
++++ b/exllamav3/exllamav3_ext/avx512_target.cpp	2026-08-04 13:53:18.319591232 -0400
+@@ -2,6 +2,9 @@
+ 
+ bool is_avx512_supported()
+ {
++#if !EXL3_X86
++    return false;
++#else
+     static bool avx512_check = false;
+     static bool avx512_supported = false;
+     if (avx512_check) return avx512_supported;
+@@ -34,4 +37,5 @@
+     // if (avx512_supported) printf("AVX-512 supported\n");
+     // else printf("AVX-512 not supported\n");
+     return avx512_supported;
++#endif
+ }
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/avx512_target.h b/exllamav3/exllamav3_ext/avx512_target.h
+--- a/exllamav3/exllamav3_ext/avx512_target.h	2026-08-09 08:37:27.775650338 -0400
++++ b/exllamav3/exllamav3_ext/avx512_target.h	2026-08-04 13:52:58.648358820 -0400
+@@ -1,12 +1,14 @@
+ #pragma once
+ 
+-#ifndef __linux__
++#include "avx2_target.h"
++
++#if EXL3_X86 && !defined(__linux__)
+     #include <intrin.h>
+ #endif
+ 
+ bool is_avx512_supported();
+ 
+-#ifdef __linux__
++#if EXL3_X86 && defined(__linux__)
+     #define AVX512_TARGET __attribute__((target("avx512f,avx512bw")))
+     #define AVX512_TARGET_OPTIONAL __attribute__((target_clones("avx512f,avx512bw","default")))
+ #else
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp	2026-08-09 08:37:29.681870765 -0400
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp	2026-08-04 13:54:01.424099327 -0400
+@@ -1,10 +1,13 @@
+-#include <immintrin.h>
+ #include "all_reduce_cpu_avx2.h"
+ #include "all_reduce_cpu_avx512.h"
+ #include "../avx2_target.h"
+ #include "../avx512_target.h"
+ #include "../util.h"
+ 
++#if EXL3_X86
++
++#include <immintrin.h>
++
+ #ifndef __linux__
+ #include <intrin.h>
+ #endif
+@@ -228,3 +231,28 @@
+         num_chunks--;
+     }
+ }
++
++#else // !EXL3_X86
++
++#include <cstdio>
++#include <cstdlib>
++
++// Non-x86 stubs. Unreachable through the native TP backend: pg_all_reduce_cpu
++// gates on is_avx2_supported(), which is false off x86, so the CPU-reduce
++// worker is never started. Definitions exist only to satisfy the linker.
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++
++void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++void perform_cpu_reduce_avx2(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce_avx2: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++#endif // EXL3_X86
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=*.so' '--exclude=__pycache__' a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp	2026-08-09 08:37:29.681870765 -0400
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp	2026-08-04 13:54:29.452428909 -0400
+@@ -1,9 +1,12 @@
+-#include <immintrin.h>
+ #include "all_reduce_cpu_avx512.h"
+ #include "all_reduce_cpu_avx2.h"
+ #include "../avx512_target.h"
+ #include "../util.h"
+ 
++#if EXL3_X86
++
++#include <immintrin.h>
++
+ #ifndef __linux__
+ #include <intrin.h>
+ #endif
+@@ -273,3 +276,26 @@
+         num_chunks--;
+     }
+ }
++
++#else // !EXL3_X86
++
++#include <cstdio>
++#include <cstdlib>
++
++// Non-x86 stubs; see all_reduce_cpu_avx2.cpp. enable_fast_fp_avx512 is only
++// reachable behind is_avx512_supported(), which is false off x86.
++void enable_fast_fp_avx512() {}
++
++void bf16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t)
++{
++    fprintf(stderr, "bf16_add_inplace_avx512: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce_avx512: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++#endif // EXL3_X86
