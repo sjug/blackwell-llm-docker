@@ -1,0 +1,106 @@
+{
+  "base": {
+    "commit": "c25cdba2c1df7a69b2d7771e4243e12a8fbf19d5",
+    "ref": "refs/heads/master",
+    "repository": "https://github.com/local-inference-lab/b12x.git"
+  },
+  "composition": {
+    "derived_from": "infernal-invocation-r18",
+    "upstream_tree": "75787c7a7431b3bea414d2ebf5f2b8671b23eb33"
+  },
+  "composition_strategy": "merge",
+  "manifest": {
+    "sha256": "a016a98716b79ad8316ad2fdb944df6e15ad5c4b7306ca9215ed79522f2ea4e5"
+  },
+  "name": "infernal-invocation-b12x-r18p-spark",
+  "pull_requests": [
+    {
+      "commits": [
+        "7f88972df71d580951115220b75923078b769fe8"
+      ],
+      "disposition": "merged",
+      "head": "7f88972df71d580951115220b75923078b769fe8",
+      "number": 145,
+      "ref": "refs/pull/145/head",
+      "title": "Qualify CUTLASS DSL 4.6.2"
+    },
+    {
+      "commits": [
+        "413f96e889dad1ae0752fd1f4be9d37f56849600"
+      ],
+      "disposition": "merged",
+      "head": "413f96e889dad1ae0752fd1f4be9d37f56849600",
+      "number": 221,
+      "ref": "refs/pull/221/head",
+      "title": "Fuse unpaired K6/MCG dense execution in CuTe DSL"
+    },
+    {
+      "commits": [
+        "3df80ee36e2a060b602897b00af377687efd9118"
+      ],
+      "disposition": "merged",
+      "head": "3df80ee36e2a060b602897b00af377687efd9118",
+      "number": 223,
+      "ref": "refs/pull/223/head",
+      "title": "Execute projection-mixed MCG K3/K4/K5 experts"
+    },
+    {
+      "commits": [
+        "e38436d76a95c586c57e06646f8ea5b8c8ed11c7"
+      ],
+      "disposition": "merged",
+      "head": "e38436d76a95c586c57e06646f8ea5b8c8ed11c7",
+      "number": 227,
+      "ref": "refs/pull/227/head",
+      "title": "Honor inactive routes in native W4A16 microkernels"
+    },
+    {
+      "commits": [
+        "50046df84a15cc5f76b94260e897fd39072b2fdf"
+      ],
+      "disposition": "merged",
+      "head": "50046df84a15cc5f76b94260e897fd39072b2fdf",
+      "number": 228,
+      "ref": "refs/pull/228/head",
+      "title": "Ignore inactive MoE routes in tiny decode"
+    },
+    {
+      "commits": [
+        "2cdd9e265cd6c4dca43e7d42c5a8cb265c92adfb"
+      ],
+      "disposition": "merged",
+      "head": "2cdd9e265cd6c4dca43e7d42c5a8cb265c92adfb",
+      "number": 229,
+      "ref": "refs/pull/229/head",
+      "title": "Align W4A16 CUDA graph tests with buffer contracts"
+    },
+    {
+      "commits": [
+        "156920046e858f413db0c51e53cd25b9020d5f40"
+      ],
+      "disposition": "merged",
+      "head": "156920046e858f413db0c51e53cd25b9020d5f40",
+      "number": 230,
+      "ref": "refs/pull/230/head",
+      "title": "Fix mapped W4A16 route namespace planning"
+    }
+  ],
+  "result": {
+    "patch": "integration.patch",
+    "patch_sha256": "e474392dea52c98fd16ca180e7ad54327c63c2623ed87ef5652bdb837a2175ab",
+    "tree": "07cdf4567b50fa983462f0f0e1bc992de3033adc"
+  },
+  "schema_version": 1,
+  "source_patches": [
+    {
+      "description": "Restore paired-M8 FC2 weight-tile reuse removed by b4d6c75; exact r18 source A/B is bit-identical and returns both tested large-M geometries to r34 parity. Preserve the standalone K6/MCG kernel by supplying the restored prefetch helper's explicit unpaired contract.",
+      "derived_from": [
+        "e94d9e778c378d217a9ccbfa37c2e9335d431fd0",
+        "b4d6c7593c9fae46f4cb6f7a645e0e10fc9c1faa",
+        "7235024420b1ca23ba8a405bb3da3b4a0a10c4f0"
+      ],
+      "path": "paired-fc2-restoration.patch",
+      "sha256": "e8d399a1c12a3a2ad8a65ab49437b5fb75ae78a00aba551fe2f193c029805ca1"
+    }
+  ]
+}
