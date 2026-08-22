@@ -1,0 +1,219 @@
+diff --git a/exllamav3/exllamav3_ext/avx2_target.cpp b/exllamav3/exllamav3_ext/avx2_target.cpp
+index f085320..b7a0b2d 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.cpp
++++ b/exllamav3/exllamav3_ext/avx2_target.cpp
+@@ -2,6 +2,9 @@
+ 
+ bool is_avx2_supported()
+ {
++#if !EXL3_X86
++    return false;
++#else
+     static bool avx2_check = false;
+     static bool avx2_supported = false;
+     if (avx2_check) return avx2_supported;
+@@ -16,4 +19,5 @@ bool is_avx2_supported()
+     // if (avx2_supported) printf("AVX2 supported\n");
+     // else printf("AVX2 not supported\n");
+     return avx2_supported;
++#endif
+ }
+\ No newline at end of file
+diff --git a/exllamav3/exllamav3_ext/avx2_target.h b/exllamav3/exllamav3_ext/avx2_target.h
+index b5f77b4..91a938b 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.h
++++ b/exllamav3/exllamav3_ext/avx2_target.h
+@@ -1,15 +1,25 @@
+ #pragma once
+ 
+-#ifndef __linux__
++// x86-only CPU feature targeting. On non-x86 hosts (e.g. aarch64 GB10 /
++// DGX Spark) the AVX translation units compile to stubs, is_avx2_supported()
++// returns false, and the native TP CPU-reduce backend fails closed at its
++// existing runtime check in all_reduce_cpu.cu.
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
++    #define EXL3_X86 1
++#else
++    #define EXL3_X86 0
++#endif
++
++#if EXL3_X86 && !defined(__linux__)
+     #include <intrin.h>
+ #endif
+ 
+ bool is_avx2_supported();
+ 
+-#ifdef __linux__
++#if EXL3_X86 && defined(__linux__)
+     #define AVX2_TARGET __attribute__((target("avx2")))
+     #define AVX2_TARGET_OPTIONAL __attribute__((target_clones("avx2","default")))
+ #else
+     #define AVX2_TARGET
+     #define AVX2_TARGET_OPTIONAL
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/exllamav3/exllamav3_ext/avx512_target.cpp b/exllamav3/exllamav3_ext/avx512_target.cpp
+index 2a676f6..729dcd0 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.cpp
++++ b/exllamav3/exllamav3_ext/avx512_target.cpp
+@@ -2,6 +2,9 @@
+ 
+ bool is_avx512_supported()
+ {
++#if !EXL3_X86
++    return false;
++#else
+     static bool avx512_check = false;
+     static bool avx512_supported = false;
+     if (avx512_check) return avx512_supported;
+@@ -34,4 +37,5 @@ bool is_avx512_supported()
+     // if (avx512_supported) printf("AVX-512 supported\n");
+     // else printf("AVX-512 not supported\n");
+     return avx512_supported;
++#endif
+ }
+diff --git a/exllamav3/exllamav3_ext/avx512_target.h b/exllamav3/exllamav3_ext/avx512_target.h
+index d953709..2a0c23f 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.h
++++ b/exllamav3/exllamav3_ext/avx512_target.h
+@@ -1,12 +1,14 @@
+ #pragma once
+ 
+-#ifndef __linux__
++#include "avx2_target.h"
++
++#if EXL3_X86 && !defined(__linux__)
+     #include <intrin.h>
+ #endif
+ 
+ bool is_avx512_supported();
+ 
+-#ifdef __linux__
++#if EXL3_X86 && defined(__linux__)
+     #define AVX512_TARGET __attribute__((target("avx512f,avx512bw")))
+     #define AVX512_TARGET_OPTIONAL __attribute__((target_clones("avx512f,avx512bw","default")))
+ #else
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+index f55148c..eb62740 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+@@ -1,10 +1,13 @@
+-#include <immintrin.h>
+ #include "all_reduce_cpu_avx2.h"
+ #include "all_reduce_cpu_avx512.h"
+ #include "../avx2_target.h"
+ #include "../avx512_target.h"
+ #include "../util.h"
+ 
++#if EXL3_X86
++
++#include <immintrin.h>
++
+ #ifndef __linux__
+ #include <intrin.h>
+ #endif
+@@ -228,3 +231,28 @@ void perform_cpu_reduce_avx2
+         num_chunks--;
+     }
+ }
++
++#else // !EXL3_X86
++
++#include <cstdio>
++#include <cstdlib>
++
++// Non-x86 stubs. Unreachable through the native TP backend: pg_all_reduce_cpu
++// gates on is_avx2_supported(), which is false off x86, so the CPU-reduce
++// worker is never started. Definitions exist only to satisfy the linker.
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++
++void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++void perform_cpu_reduce_avx2(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce_avx2: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++#endif // EXL3_X86
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+index e9bc401..9b0a114 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+@@ -1,9 +1,12 @@
+-#include <immintrin.h>
+ #include "all_reduce_cpu_avx512.h"
+ #include "all_reduce_cpu_avx2.h"
+ #include "../avx512_target.h"
+ #include "../util.h"
+ 
++#if EXL3_X86
++
++#include <immintrin.h>
++
+ #ifndef __linux__
+ #include <intrin.h>
+ #endif
+@@ -273,3 +276,26 @@ void perform_cpu_reduce_avx512
+         num_chunks--;
+     }
+ }
++
++#else // !EXL3_X86
++
++#include <cstdio>
++#include <cstdlib>
++
++// Non-x86 stubs; see all_reduce_cpu_avx2.cpp. enable_fast_fp_avx512 is only
++// reachable behind is_avx512_supported(), which is false off x86.
++void enable_fast_fp_avx512() {}
++
++void bf16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t)
++{
++    fprintf(stderr, "bf16_add_inplace_avx512: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    fprintf(stderr, "perform_cpu_reduce_avx512: native TP CPU-reduce backend is x86-only\n");
++    abort();
++}
++
++#endif // EXL3_X86
+diff --git a/exllamav3/modules/quant/exl3_lib/quantize.py b/exllamav3/modules/quant/exl3_lib/quantize.py
+index a9cdca3..4b5a4e9 100644
+--- a/exllamav3/modules/quant/exl3_lib/quantize.py
++++ b/exllamav3/modules/quant/exl3_lib/quantize.py
+@@ -68,8 +68,10 @@ def quantize_tiles(tiles, quant_args: dict):
+     assert tiles.dtype == torch.float
+ 
+     K = quant_args["K"]
+-    mcg = "mcg" in quant_args
+-    mul1 = "mul1" in quant_args
++    mcg = bool(quant_args.get("mcg", False))
++    mul1 = bool(quant_args.get("mul1", False))
++    if mcg and mul1:
++        raise ValueError("mcg and mul1 are mutually exclusive")
+     quantized_tiles = torch.zeros_like(tiles)
+     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
+     temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+@@ -168,8 +170,10 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
+ 
+                 # Work buffers
+                 K = quant_args["K"]
+-                mcg = "mcg" in quant_args
+-                mul1 = "mul1" in quant_args
++                mcg = bool(quant_args.get("mcg", False))
++                mul1 = bool(quant_args.get("mul1", False))
++                if mcg and mul1:
++                    raise ValueError("mcg and mul1 are mutually exclusive")
+                 temp_costs, temp_edges = get_temp_buffers(device, K)
+ 
+                 ext.quantize_tiles(

@@ -40,10 +40,10 @@ case "${MODEL_FAMILY:-}" in
     export ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
     export DCP_KV_CACHE_INTERLEAVE_SIZE="${DCP_KV_CACHE_INTERLEAVE_SIZE:-1}"
     export F8_DMA="${F8_DMA:-0}"
-    export VLLM_EXL3_TRELLIS_MAX_M="${VLLM_EXL3_TRELLIS_MAX_M:-32}"
-    export VLLM_EXL3_TRELLIS_BLOCK_M="${VLLM_EXL3_TRELLIS_BLOCK_M:-8}"
-    export VLLM_EXL3_PREFILL_TRELLIS="${VLLM_EXL3_PREFILL_TRELLIS:-1}"
-    export VLLM_EXL3_PREFILL_CHUNK="${VLLM_EXL3_PREFILL_CHUNK:-128}"
+    # II r17-spark (2026-08-18): the four GG EXL3 tuning exports are
+    # REMOVED unconditionally - that set collapsed II mixed-Trellis
+    # prefill to 169 tok/s at r10. GG images keep them in their own
+    # launcher; II must never apply GG tuning (no profile switch).
     model_command=("${glm52_server}" "$@")
     ;;
   ds4|ds4-flash|dspark)
