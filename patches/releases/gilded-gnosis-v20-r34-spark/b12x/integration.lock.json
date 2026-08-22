@@ -1,0 +1,40 @@
+{
+  "base": {
+    "commit": "7cecbb2c4819636ae7f05f8b116f2c45ee2cff7b",
+    "ref": "refs/heads/master",
+    "repository": "https://github.com/local-inference-lab/b12x.git"
+  },
+  "manifest": {
+    "sha256": "a2ee258e1c67223ed067cf2315bf47514b2da6cbec8f5d27cc9c11097d1bc012"
+  },
+  "name": "gilded-gnosis-v20-b12x",
+  "pull_requests": [
+    {
+      "disposition": "merged",
+      "head": "282d61a483c908eaa440a19ba0d70a557c73197f",
+      "number": 125,
+      "ref": "refs/pull/125/head",
+      "title": "Declare compressed MLA decode row capacity"
+    },
+    {
+      "disposition": "merged",
+      "head": "287fec1c8e6457a5d687f0b7a96a4e1579c1b791",
+      "number": 133,
+      "ref": "refs/pull/133/head",
+      "title": "Add topology-scoped fused all-reduce paths"
+    },
+    {
+      "disposition": "merged",
+      "head": "c8d5f33b4a682a4a0b06e29c816aa24e28313473",
+      "number": 144,
+      "ref": "refs/pull/144/head",
+      "title": "Add native R7 mixed K3/K4/K5 Trellis runtime"
+    }
+  ],
+  "result": {
+    "patch": "integration.patch",
+    "patch_sha256": "406970efd643f5a7d1c989b7d988331b16ab7e84d868cf2d9cbabb7707633687",
+    "tree": "cd3ce190f0f1917402cdfd5773724267cc9a63f8"
+  },
+  "schema_version": 1
+}

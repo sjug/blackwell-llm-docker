@@ -2,6 +2,18 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-voipmonitor/vllm:vllm-b12x-cu132}"
+# Container engine: docker (default) or podman. Rootless podman works; all
+# build stages are compile-only and do not need GPU access.
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile.vllm-b12x-cu132}"
+# CUDA target archs. Defaults are the historical SM120 x86_64 values; for
+# GB10 / DGX Spark (SM121) use 12.1a / 121a / 12.1a / 12.1 (FlashInfer
+# refuses to run SM120 cubins on SM121 and only enables its sm121 AOT
+# modules when 12.1a is in the arch list).
+TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG:-12.0a}"
+CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG:-120a}"
+FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG:-12.0f}"
+PLAIN_CUDA_ARCH_LIST_ARG="${PLAIN_CUDA_ARCH_LIST_ARG:-12.0}"
 SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE:-voipmonitor/vllm:vllm-b12x-cu132-system-base}"
 BUILD_BASE_IMAGE_TAG="${BUILD_BASE_IMAGE_TAG:-voipmonitor/vllm:vllm-b12x-cu132-build-base}"
 BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE:-1}"
@@ -19,6 +31,11 @@ FLASHINFER_REF="${FLASHINFER_REF:-refs/pull/3395/head}"
 FLASHINFER_BUILD_CUBIN="${FLASHINFER_BUILD_CUBIN:-1}"
 DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}"
 DEEPGEMM_REF="${DEEPGEMM_REF:-refs/pull/324/head}"
+DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE:-}"
+DEEPGEMM_PATCH_SHA256="${DEEPGEMM_PATCH_SHA256:-}"
+SKIP_EXLLAMAV3="${SKIP_EXLLAMAV3:-0}"
+EXLLAMAV3_PATCH_FILE="${EXLLAMAV3_PATCH_FILE:-}"
+EXLLAMAV3_PATCH_SHA256="${EXLLAMAV3_PATCH_SHA256:-}"
 EXLLAMAV3_REPO="${EXLLAMAV3_REPO:-https://github.com/brandonmmusic-max/exllamav3.git}"
 EXLLAMAV3_REF="${EXLLAMAV3_REF:-a1-retile-sm120}"
 B12X_REPO="${B12X_REPO:-https://github.com/local-inference-lab/b12x.git}"
@@ -372,8 +389,36 @@ if [[ -n "${LMCACHE_PATCH_FILE}" ]]; then
   LMCACHE_PATCH_SHA256="${lmcache_local_patch_sha}"
 fi
 
+if [[ -n "${DEEPGEMM_PATCH_FILE}" ]]; then
+  deepgemm_local_patch_path="patches/${DEEPGEMM_PATCH_FILE}"
+  if [[ ! -f "${deepgemm_local_patch_path}" ]]; then
+    echo "DEEPGEMM_PATCH_FILE not found: ${deepgemm_local_patch_path}" >&2
+    exit 1
+  fi
+  deepgemm_local_patch_sha="$(sha256sum "${deepgemm_local_patch_path}" | awk '{print $1}')"
+  if [[ -n "${DEEPGEMM_PATCH_SHA256}" && "${deepgemm_local_patch_sha}" != "${DEEPGEMM_PATCH_SHA256}" ]]; then
+    echo "DEEPGEMM_PATCH_FILE SHA256 mismatch: got ${deepgemm_local_patch_sha}, expected ${DEEPGEMM_PATCH_SHA256}" >&2
+    exit 1
+  fi
+  DEEPGEMM_PATCH_SHA256="${deepgemm_local_patch_sha}"
+fi
+
+if [[ -n "${EXLLAMAV3_PATCH_FILE}" ]]; then
+  exllamav3_local_patch_path="patches/${EXLLAMAV3_PATCH_FILE}"
+  if [[ ! -f "${exllamav3_local_patch_path}" ]]; then
+    echo "EXLLAMAV3_PATCH_FILE not found: ${exllamav3_local_patch_path}" >&2
+    exit 1
+  fi
+  exllamav3_local_patch_sha="$(sha256sum "${exllamav3_local_patch_path}" | awk '{print $1}')"
+  if [[ -n "${EXLLAMAV3_PATCH_SHA256}" && "${exllamav3_local_patch_sha}" != "${EXLLAMAV3_PATCH_SHA256}" ]]; then
+    echo "EXLLAMAV3_PATCH_FILE SHA256 mismatch: got ${exllamav3_local_patch_sha}, expected ${EXLLAMAV3_PATCH_SHA256}" >&2
+    exit 1
+  fi
+  EXLLAMAV3_PATCH_SHA256="${exllamav3_local_patch_sha}"
+fi
+
 runtime_files_sha="$({
-  sha256sum Dockerfile.vllm-b12x-cu132
+  sha256sum "${DOCKERFILE}"
   sha256sum tests/verify_xgrammar_required_tools.py
   find launchers -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | awk '{print $1}')"
@@ -391,9 +436,14 @@ cache_hash="$(printf '%s\n' \
   "DEEPGEMM_REPO=${DEEPGEMM_REPO}" \
   "DEEPGEMM_REF=${DEEPGEMM_REF}" \
   "DEEPGEMM_COMMIT=${DEEPGEMM_COMMIT}" \
+  "DEEPGEMM_PATCH_FILE=${DEEPGEMM_PATCH_FILE}" \
+  "DEEPGEMM_PATCH_SHA256=${DEEPGEMM_PATCH_SHA256}" \
+  "SKIP_EXLLAMAV3=${SKIP_EXLLAMAV3}" \
   "EXLLAMAV3_REPO=${EXLLAMAV3_REPO}" \
   "EXLLAMAV3_REF=${EXLLAMAV3_REF}" \
   "EXLLAMAV3_COMMIT=${EXLLAMAV3_COMMIT}" \
+  "EXLLAMAV3_PATCH_FILE=${EXLLAMAV3_PATCH_FILE}" \
+  "EXLLAMAV3_PATCH_SHA256=${EXLLAMAV3_PATCH_SHA256}" \
   "B12X_REPO=${B12X_REPO}" \
   "B12X_REF=${B12X_REF}" \
   "B12X_COMMIT=${B12X_COMMIT}" \
@@ -469,7 +519,10 @@ echo "  VLLM_NVCC_THREADS=${VLLM_NVCC_THREADS}"
 echo "  FLASHINFER_REF=${FLASHINFER_REF} ${FLASHINFER_COMMIT}"
 echo "  FLASHINFER_BUILD_CUBIN=${FLASHINFER_BUILD_CUBIN}"
 echo "  DEEPGEMM_REF=${DEEPGEMM_REF} ${DEEPGEMM_COMMIT}"
-echo "  EXLLAMAV3_REF=${EXLLAMAV3_REF} ${EXLLAMAV3_COMMIT}"
+echo "  DEEPGEMM_PATCH_FILE=${DEEPGEMM_PATCH_FILE} sha256=${DEEPGEMM_PATCH_SHA256}"
+echo "  DOCKERFILE=${DOCKERFILE} engine=${CONTAINER_ENGINE}"
+echo "  ARCHS torch=${TORCH_CUDA_ARCH_LIST_ARG} cmake=${CMAKE_CUDA_ARCHITECTURES_ARG} flashinfer=${FLASHINFER_CUDA_ARCH_LIST_ARG} plain=${PLAIN_CUDA_ARCH_LIST_ARG}"
+echo "  EXLLAMAV3_REF=${EXLLAMAV3_REF} ${EXLLAMAV3_COMMIT} skip=${SKIP_EXLLAMAV3}"
 echo "  B12X_REF=${B12X_REF} ${B12X_COMMIT}"
 echo "  B12X_PATCH_SHA256=${B12X_PATCH_SHA256}"
 echo "  B12X_PATCH_FILE=${B12X_PATCH_FILE}"
@@ -503,37 +556,58 @@ echo "  LMCACHE_INTEGRATION_PRS=${LMCACHE_INTEGRATION_PRS}"
 echo "  XGRAMMAR=${XGRAMMAR_REPO} ${XGRAMMAR_REF} ${XGRAMMAR_COMMIT} version=${XGRAMMAR_VERSION} transformers5_compat=${XGRAMMAR_TRANSFORMERS5_COMPAT}"
 echo "  CACHE_FINGERPRINT=${CACHE_FINGERPRINT}"
 
+# podman/buildah does not know --progress; docker BuildKit wants plain output.
+# For podman, force docker image format: the OCI format does not persist the
+# SHELL directive, so RUN steps in stages built FROM a tagged OCI base image
+# would silently fall back to /bin/sh.
+PROGRESS_ARGS=()
+if [[ "${CONTAINER_ENGINE}" == "docker" ]]; then
+  PROGRESS_ARGS=(--progress=plain)
+else
+  PROGRESS_ARGS=(--format docker)
+fi
+
 if [[ "${BUILD_BASE_IMAGE}" == "1" ]]; then
-  DOCKER_BUILDKIT=1 docker build \
+  DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
     --target vllm-b12x-cu132-system-base-build \
     --build-arg NCCL_REPO="${NCCL_REPO}" \
     --build-arg NCCL_REF="${NCCL_REF}" \
     --build-arg NCCL_COMMIT="${NCCL_COMMIT}" \
-    --progress=plain \
-    -f Dockerfile.vllm-b12x-cu132 \
+    "${PROGRESS_ARGS[@]}" \
+    -f "${DOCKERFILE}" \
     -t "${SYSTEM_BASE_IMAGE}" \
     "$@" \
     .
 
-  DOCKER_BUILDKIT=1 docker build \
+  DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
     --target vllm-b12x-cu132-build-base-build \
     --build-arg VLLM_B12X_CU132_SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE}" \
     --build-arg CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" \
-    --progress=plain \
-    -f Dockerfile.vllm-b12x-cu132 \
+    --build-arg TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG}" \
+    --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
+    --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
+    "${PROGRESS_ARGS[@]}" \
+    -f "${DOCKERFILE}" \
     -t "${BUILD_BASE_IMAGE_TAG}" \
     "$@" \
     .
 
   if [[ "${PUSH_BASE_IMAGE}" == "1" ]]; then
-    docker push "${SYSTEM_BASE_IMAGE}"
-    docker push "${BUILD_BASE_IMAGE_TAG}"
+    "${CONTAINER_ENGINE}" push "${SYSTEM_BASE_IMAGE}"
+    "${CONTAINER_ENGINE}" push "${BUILD_BASE_IMAGE_TAG}"
   fi
 fi
 
-DOCKER_BUILDKIT=1 docker build \
+DOCKER_BUILDKIT=1 "${CONTAINER_ENGINE}" build \
   --build-arg VLLM_B12X_CU132_SYSTEM_BASE_IMAGE="${SYSTEM_BASE_IMAGE}" \
   --build-arg VLLM_B12X_CU132_BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE_TAG}" \
+  --build-arg TORCH_CUDA_ARCH_LIST_ARG="${TORCH_CUDA_ARCH_LIST_ARG}" \
+  --build-arg CMAKE_CUDA_ARCHITECTURES_ARG="${CMAKE_CUDA_ARCHITECTURES_ARG}" \
+  --build-arg FLASHINFER_CUDA_ARCH_LIST_ARG="${FLASHINFER_CUDA_ARCH_LIST_ARG}" \
+  --build-arg PLAIN_CUDA_ARCH_LIST_ARG="${PLAIN_CUDA_ARCH_LIST_ARG}" \
+  --build-arg DEEPGEMM_PATCH_FILE="${DEEPGEMM_PATCH_FILE}" \
+  --build-arg DEEPGEMM_PATCH_SHA256="${DEEPGEMM_PATCH_SHA256}" \
+  --build-arg SKIP_EXLLAMAV3="${SKIP_EXLLAMAV3}" \
   --build-arg MAX_JOBS="${MAX_JOBS}" \
   --build-arg VLLM_MAX_JOBS="${VLLM_MAX_JOBS}" \
   --build-arg NVCC_THREADS="${NVCC_THREADS}" \
@@ -551,6 +625,8 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg EXLLAMAV3_REPO="${EXLLAMAV3_REPO}" \
   --build-arg EXLLAMAV3_REF="${EXLLAMAV3_REF}" \
   --build-arg EXLLAMAV3_COMMIT="${EXLLAMAV3_COMMIT}" \
+  --build-arg EXLLAMAV3_PATCH_FILE="${EXLLAMAV3_PATCH_FILE}" \
+  --build-arg EXLLAMAV3_PATCH_SHA256="${EXLLAMAV3_PATCH_SHA256}" \
   --build-arg B12X_REPO="${B12X_REPO}" \
   --build-arg B12X_REF="${B12X_REF}" \
   --build-arg B12X_COMMIT="${B12X_COMMIT}" \
@@ -605,33 +681,33 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg HUMMING_KERNELS_SPEC="${HUMMING_KERNELS_SPEC}" \
   --build-arg VLLM_RUNTIME_EXTRA_PACKAGES="${VLLM_RUNTIME_EXTRA_PACKAGES}" \
   --build-arg CACHE_FINGERPRINT="${CACHE_FINGERPRINT}" \
-  --progress=plain \
-  -f Dockerfile.vllm-b12x-cu132 \
+  "${PROGRESS_ARGS[@]}" \
+  -f "${DOCKERFILE}" \
   -t "${IMAGE}" \
   "$@" \
   .
 
-image_cache_fingerprint="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.cache.fingerprint"}}')"
+image_cache_fingerprint="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.cache.fingerprint"}}')"
 [[ "${image_cache_fingerprint}" == "${CACHE_FINGERPRINT}" ]] || {
   echo "Image cache fingerprint mismatch: got ${image_cache_fingerprint}, expected ${CACHE_FINGERPRINT}" >&2
   exit 1
 }
 
-image_exllamav3_commit="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.exllamav3.commit"}}')"
+image_exllamav3_commit="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.exllamav3.commit"}}')"
 [[ "${image_exllamav3_commit}" == "${EXLLAMAV3_COMMIT}" ]] || {
   echo "Image EXL3 source mismatch: got ${image_exllamav3_commit}, expected ${EXLLAMAV3_COMMIT}" >&2
   exit 1
 }
 
-image_lmcache_commit="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.commit"}}')"
+image_lmcache_commit="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.commit"}}')"
 [[ "${image_lmcache_commit}" == "${LMCACHE_COMMIT}" ]] || {
   echo "Image LMCache source mismatch: got ${image_lmcache_commit}, expected ${LMCACHE_COMMIT}" >&2
   exit 1
 }
 if [[ "${REQUIRE_CLEAN_LMCACHE_COMPOSITION}" == "1" ]]; then
-  image_lmcache_tree="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.tree"}}')"
-  image_lmcache_prs="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.prs"}}')"
-  image_lmcache_lock_sha="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.lock_sha256"}}')"
+  image_lmcache_tree="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.tree"}}')"
+  image_lmcache_prs="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.prs"}}')"
+  image_lmcache_lock_sha="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.lmcache.integration.lock_sha256"}}')"
   [[ "${image_lmcache_tree}" == "${LMCACHE_INTEGRATION_TREE}" ]] || {
     echo "Image LMCache integration tree mismatch: got ${image_lmcache_tree}, expected ${LMCACHE_INTEGRATION_TREE}" >&2
     exit 1
@@ -647,9 +723,9 @@ if [[ "${REQUIRE_CLEAN_LMCACHE_COMPOSITION}" == "1" ]]; then
 fi
 
 if [[ -n "${XGRAMMAR_REF}" ]]; then
-  image_xgrammar_commit="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.commit"}}')"
-  image_xgrammar_version="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.version"}}')"
-  image_xgrammar_transformers5_compat="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.transformers5_compat"}}')"
+  image_xgrammar_commit="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.commit"}}')"
+  image_xgrammar_version="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.version"}}')"
+  image_xgrammar_transformers5_compat="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{index .Config.Labels "local-inference.xgrammar.transformers5_compat"}}')"
   [[ "${image_xgrammar_commit}" == "${XGRAMMAR_COMMIT}" ]] || {
     echo "Image xgrammar source mismatch: got ${image_xgrammar_commit}, expected ${XGRAMMAR_COMMIT}" >&2
     exit 1
@@ -664,7 +740,7 @@ if [[ -n "${XGRAMMAR_REF}" ]]; then
   }
 fi
 
-image_env="$(docker image inspect "${IMAGE}" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+image_env="$("${CONTAINER_ENGINE}" image inspect "${IMAGE}" --format '{{range .Config.Env}}{{println .}}{{end}}')"
 cache_root="/cache/jit/${CACHE_FINGERPRINT}"
 for expected in \
   "LOCAL_INFERENCE_CACHE_FINGERPRINT=${CACHE_FINGERPRINT}" \
