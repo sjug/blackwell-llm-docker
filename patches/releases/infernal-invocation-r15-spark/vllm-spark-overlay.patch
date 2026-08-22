@@ -1,0 +1,62 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9c01c92eb..ffa722a9d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,13 +117,13 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.4)
+   # Rubin (10.7) can run SM100 family code, but CUDA 13.4 also supports
+   # targeting it directly.
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0;12.1")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
+    # to support the whole generation without specifying all sub-architectures
+    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 0035f64ef..cd401e50c 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -22,6 +22,7 @@ from __future__ import annotations
+ 
+ import ctypes
+ import dataclasses
++import functools
+ import gc
+ import importlib
+ import json
+@@ -972,13 +973,27 @@ def _warm_b12x_trellis_device(
+     _B12X_TRELLIS_WARMED_DEVICES.add(device_index)
+ 
+ 
++@functools.lru_cache(maxsize=8)
++def _b12x_small_trellis_kernel_capable(device_index: int) -> bool:
++    """True when this device can compile the capture-safe small-M K6 kernel.
++
++    b12x _use_k6_small admits only compute capability (12, 0); on every
++    other architecture the generic W4A16 kernel serves rows <= 128 and
++    consumes real padded scratch (SM121 finding, 2026-08-15).
++    """
++
++    return tuple(torch.cuda.get_device_capability(device_index)) == (12, 0)
++
++
+ def _b12x_trellis_c_tmp_elements(rows: int, columns: int) -> int:
+     """Return graph-safe dense-W4A16 scratch capacity for one static shape."""
+ 
+     rows = int(rows)
+     columns = int(columns)
+-    if rows <= 128:
+-        # The cooperative K6 small-M kernel does not consume W4A16 scratch.
++    if rows <= 128 and _b12x_small_trellis_kernel_capable(
++        torch.cuda.current_device()
++    ):
++        # The capture-safe K6 small-M kernel does not consume W4A16 scratch.
+         return 1
+     padded_rows = max(
+         ((rows + 47) // 48) * 48,
